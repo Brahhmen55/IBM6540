@@ -1,0 +1,391 @@
+---
+title: "M05: Reflection on Ch09 (Evaluation)"
+author: "Luis Berimen"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-expand: 1
+    toc-location: right-body
+    toc-title: "Contents"
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    theme: cosmo
+    highlight-style: github
+    df-print: paged
+    embed-resources: true
+output-file: index.html
+execute:
+  warning: false
+  message: false
+  freeze: true
+crossref:
+  fig-title: "Figure"
+  tbl-title: "Table"
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(tidymodels)
+library(tidyverse)
+library(gt)
+library(patchwork)
+
+tidymodels_prefer()
+set.seed(2026)
+```
+
+# Data and reference models
+
+The analysis uses the synthetic direct-mail data and modeling workflow supplied in the codebook. Each row represents a prospect. The classification outcome, `responded`, records whether the prospect purchased after receiving a campaign. The regression outcome, `order_value_next`, represents the customer's next-order value.
+
+```{r}
+#| label: data-models
+#| code-summary: "Show data generation and model setup"
+set.seed(123)
+n <- 3000
+
+mail_data <- tibble(
+  customer_id = paste0("C", str_pad(1:n, 5, pad = "0")),
+  age = round(rnorm(n, mean = 45, sd = 12)),
+  income = round(rlnorm(n, meanlog = 10.8, sdlog = 0.6)),
+  recency_days = round(rexp(n, rate = 1 / 60)),
+  freq_12mo = rpois(n, lambda = 3),
+  avg_order_amt = round(rlnorm(n, meanlog = 4.2, sdlog = 0.5), 2),
+  channel = sample(c("email", "direct_mail", "digital"), n, replace = TRUE,
+                   prob = c(0.5, 0.3, 0.2)),
+  region = sample(c("West", "South", "Midwest", "Northeast"), n, replace = TRUE),
+  loyalty_tier = factor(
+    sample(c("Bronze", "Silver", "Gold", "Platinum"), n, replace = TRUE,
+           prob = c(0.4, 0.3, 0.2, 0.1)),
+    levels = c("Bronze", "Silver", "Gold", "Platinum")
+  ),
+  responded = rbinom(
+    n, 1,
+    prob = plogis(-3 + 0.02 * (age - 45) +
+                    0.3 * log(income / 50000) +
+                    0.1 * freq_12mo - 0.005 * recency_days)
+  )
+) |>
+  mutate(
+    income = if_else(runif(n) < 0.08, NA_real_, income),
+    avg_order_amt = if_else(runif(n) < 0.05, NA_real_, avg_order_amt),
+    responded = factor(responded, levels = c(1, 0), labels = c("yes", "no")),
+    order_value_next = round(
+      pmax(0, 15 +
+             0.0006 * coalesce(income, median(income, na.rm = TRUE)) +
+             4 * freq_12mo - 0.05 * recency_days + rnorm(n, 0, 20)),
+      2
+    )
+  )
+
+set.seed(617)
+mail_split <- initial_split(mail_data, prop = 0.80, strata = responded)
+mail_train <- training(mail_split)
+mail_test <- testing(mail_split)
+
+mail_rec <- recipe(
+  responded ~ age + income + recency_days + freq_12mo + avg_order_amt +
+    channel + region + loyalty_tier,
+  data = mail_train
+) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_log(income, avg_order_amt, recency_days, base = 10, offset = 1) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors())
+
+lr_spec <- logistic_reg(penalty = 0.01, mixture = 1) |>
+  set_engine("glmnet") |>
+  set_mode("classification")
+
+mail_wf <- workflow() |>
+  add_recipe(mail_rec) |>
+  add_model(lr_spec)
+
+mail_fit <- fit(mail_wf, data = mail_train)
+test_preds <- augment(mail_fit, new_data = mail_test)
+
+class_metrics <- metric_set(accuracy, sens, spec, precision, f_meas)
+
+reg_spec <- linear_reg() |> set_engine("lm")
+reg_rec <- recipe(
+  order_value_next ~ income + freq_12mo + recency_days,
+  data = mail_train
+) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors())
+reg_wf <- workflow() |> add_recipe(reg_rec) |> add_model(reg_spec)
+reg_fit <- fit(reg_wf, data = mail_train)
+reg_preds <- augment(reg_fit, new_data = mail_test)
+```
+
+# Exercises
+
+## Exercise 9.1 — Confusion Matrix and Threshold Tradeoff
+
+**Part A — Reading the Confusion Matrix**
+
+Run `conf_mat(test_preds, truth = responded, estimate = .pred_class)` and use the output to answer:
+
+1.  How many customers actually responded ("yes") and were correctly predicted to respond? What is this cell called?
+2.  How many customers actually responded but were predicted "no"? What is this cell called, and what does it cost a marketer?
+3.  How many customers did not respond but were predicted "yes"? What is this cell called, and what does it cost a marketer?
+4.  In plain English, which type of error is more costly for a direct-mail campaign with a \$5 mailing cost and \$50 average order value — a false positive or a false negative? Explain your reasoning.
+
+### Response
+
+```{r}
+#| label: tbl-confusion
+#| tbl-cap: "Confusion matrix for the held-out test set"
+cm_91 <- conf_mat(test_preds, truth = responded, estimate = .pred_class)
+cm_91
+
+# Extract counts directly from the confusion-matrix table.
+# Rows are predicted classes and columns are actual classes.
+# This avoids column-name differences across yardstick versions.
+tp <- unname(cm_91$table["yes", "yes"])
+fn <- unname(cm_91$table["no",  "yes"])
+fp <- unname(cm_91$table["yes", "no"])
+tn <- unname(cm_91$table["no",  "no"])
+```
+
+1.  The model correctly predicted **`r tp` actual responders** as "yes." This is the **true-positive (TP)** cell.
+2.  It predicted **`r fn` actual responders** as "no." These are **false negatives (FN)**. For the marketer, each false negative is a missed opportunity to contact a customer who was likely to purchase.
+3.  It predicted **`r fp` nonresponders** as "yes." These are **false positives (FP)**. Each one causes the company to spend the \$5 mailing cost without receiving a response.
+4.  A false negative is more costly under the simplified values in the prompt. A false positive loses approximately **\$5**, while a false negative gives up an expected **\$50 order** and avoids only the \$5 mailing expense. The approximate net opportunity cost of the false negative is therefore \$45. This conclusion assumes the \$50 is comparable to contribution value; if it is revenue rather than profit, the true economic comparison should use margin.\[\^1\]
+
+::: {.callout-important title="Customer-oriented interpretation"}
+The model should help customers receive relevant offers while limiting unwanted mail. Because missing an interested customer has a much larger stated cost than mailing one uninterested customer, the campaign should emphasize **sensitivity**, while still monitoring precision so customers are not contacted indiscriminately.
+:::
+
+**Part B — Threshold Tradeoff**
+
+Using `test_preds`, compute `precision` and `sens` at the default 0.5 threshold. Now manually create a new `.pred_class` column using a threshold of 0.3 instead (classify as "yes" if `.pred_yes > 0.3`). Recompute both metrics. Which one increased, and why does lowering the threshold have that effect?
+
+### Response
+
+```{r}
+#| label: tbl-thresholds
+#| tbl-cap: "Precision and sensitivity at two probability thresholds"
+preds_050 <- test_preds |>
+  mutate(
+    pred_threshold = factor(
+      if_else(.pred_yes > 0.50, "yes", "no"),
+      levels = levels(responded)
+    )
+  )
+
+metrics_050 <- metric_set(precision, sens)(
+  preds_050,
+  truth = responded,
+  estimate = pred_threshold
+) |>
+  mutate(cutoff = 0.50)
+
+preds_030 <- test_preds |>
+  mutate(
+    pred_threshold = factor(
+      if_else(.pred_yes > 0.30, "yes", "no"),
+      levels = levels(responded)
+    )
+  )
+
+metrics_030 <- metric_set(precision, sens)(
+  preds_030,
+  truth = responded,
+  estimate = pred_threshold
+) |>
+  mutate(cutoff = 0.30)
+
+threshold_results <- bind_rows(metrics_050, metrics_030) |>
+  relocate(cutoff)
+
+threshold_results |>
+  mutate(.estimate = scales::percent(.estimate, accuracy = 0.1)) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  gt()
+```
+
+Lowering the threshold makes the model more willing to classify a prospect as "yes." Therefore, **sensitivity can only stay the same or increase**, because some observations previously classified as false negatives may become true positives. Precision may decrease because the additional positive classifications can include more false positives.
+
+For this particular rare-response dataset, it is possible that both 0.50 and 0.30 remain above every predicted probability. When that happens, the model predicts no positive cases at either threshold and the two metrics do not change. That result does not contradict the threshold principle; it means 0.30 was not low enough to cross any observed probability. A lower cutoff or a business rule such as mailing the top 10% would create the expected tradeoff.
+
+## Exercise 9.2 — ROC/AUC Interpretation and Custom `metric_set()`
+
+**Part A — Interpreting AUC**
+
+The notebook computed `roc_auc` for the direct-mail response model.
+
+1.  Look up the AUC value from the `roc-curve` chunk. Is it above or below 0.65 (the "usable for targeting" threshold from the callout)?
+2.  In plain English, what does an AUC of that value mean? Complete this sentence: "If we randomly pick one customer who responded and one who did not, the model assigns a higher predicted probability to the responder \_\_\_\_% of the time."
+3.  The ROC curve plot shows the sensitivity/specificity tradeoff across all thresholds. At what point on the curve would you operate if your campaign budget only allows you to mail the top 10% of prospects?
+
+### Response
+
+```{r}
+#| label: fig-roc
+#| fig-cap: "ROC curve for the direct-mail response model"
+auc_result <- test_preds |> roc_auc(truth = responded, .pred_yes)
+auc_value <- auc_result |> pull(.estimate)
+
+roc_data <- test_preds |> roc_curve(truth = responded, .pred_yes)
+autoplot(roc_data) +
+  labs(
+    title = "ROC Curve — Direct-Mail Response Model",
+    subtitle = paste0("AUC = ", round(auc_value, 3)),
+    x = "1 − Specificity",
+    y = "Sensitivity"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+1.  The test-set AUC is **`r round(auc_value, 3)`**, which is **`r if_else(auc_value >= 0.65, "above", "below")` 0.65**.
+2.  The interpretation is: “If we randomly pick one customer who responded and one who did not, the model assigns a higher predicted probability to the responder **`r round(100 * auc_value, 1)`%** of the time.” AUC measures ranking or discrimination, not the percentage of individual classifications that are correct.
+3.  A 10% mailing budget is not selected directly by choosing a fixed point such as 0.5 on the ROC curve. I would sort prospects by `.pred_yes`, select the top 10%, and use the probability of the last selected prospect as the operating threshold. I would then locate the corresponding sensitivity and false-positive rate on the ROC curve. This converts the budget constraint into a decision threshold.
+
+```{r}
+#| label: top-ten
+#| code-summary: "Show the top-10% operating threshold calculation"
+mail_n <- ceiling(0.10 * nrow(test_preds))
+top10_threshold <- test_preds |>
+  arrange(desc(.pred_yes)) |>
+  slice(mail_n) |>
+  pull(.pred_yes)
+
+top10_performance <- test_preds |>
+  mutate(
+    top10_class = factor(
+      if_else(.pred_yes >= top10_threshold, "yes", "no"),
+      levels = levels(responded)
+    )
+  ) |>
+  metric_set(sens, spec, precision)(truth = responded, estimate = top10_class)
+
+top10_performance
+```
+
+**Part B — Custom `metric_set()`**
+
+Create a `metric_set()` containing `accuracy`, `roc_auc`, `sens`, `spec`, and `f_meas`. Apply it to `test_preds`. If you had to report just **two** of these five numbers to a VP of Marketing who is unfamiliar with machine learning metrics, which would you choose and why?
+
+### Response
+
+```{r}
+#| label: tbl-custom-metrics
+#| tbl-cap: "Classification metrics for the held-out test set"
+vp_metrics <- metric_set(accuracy, roc_auc, sens, spec, f_meas)
+vp_results <- test_preds |>
+  vp_metrics(
+    truth = responded,
+    estimate = .pred_class,
+    .pred_yes
+  )
+
+vp_results |>
+  mutate(.estimate = round(.estimate, 3)) |>
+  gt()
+```
+
+I would report **ROC AUC** and **sensitivity**. ROC AUC tells the VP how effectively the model ranks likely responders above nonresponders across all possible thresholds. Sensitivity answers the more concrete campaign question: “Of the customers who would respond, how many did we identify?”
+
+I would not lead with accuracy because the response class is rare. A model that predicts “no” for every customer can appear highly accurate while finding no customers to target. The two selected metrics are therefore less likely to create a misleading impression of business usefulness.
+
+## Exercise 9.3 — Regression Metric Sensitivity to Outliers
+
+Add one synthetic "whale" customer to `reg_preds` with `order_value_next = 5000` and `.pred = 200` (a badly missed prediction). Recompute `rmse` and `mae`. Which metric moved more in percentage terms? What does this tell you about choosing RMSE vs. MAE for marketing data with occasional huge orders?
+
+### Response
+
+The formulas explain the expected difference:
+
+$$RMSE = \sqrt{\frac{1}{n}\sum_{i=1}^{n}(y_i-\hat{y}_i)^2}$$ {#eq-rmse}
+
+$$MAE = \frac{1}{n}\sum_{i=1}^{n}|y_i-\hat{y}_i|$$ {#eq-mae}
+
+Because @eq-rmse squares each error, the whale's \$4,800 miss receives much more weight than it does in @eq-mae.
+
+```{r}
+#| label: tbl-whale
+#| tbl-cap: "Effect of one extreme prediction error on RMSE and MAE"
+baseline_reg <- reg_preds |>
+  metric_set(rmse, mae)(truth = order_value_next, estimate = .pred) |>
+  select(.metric, baseline = .estimate)
+
+whale_preds <- reg_preds |>
+  select(order_value_next, .pred) |>
+  add_row(order_value_next = 5000, .pred = 200)
+
+whale_reg <- whale_preds |>
+  metric_set(rmse, mae)(truth = order_value_next, estimate = .pred) |>
+  select(.metric, with_whale = .estimate)
+
+whale_comparison <- left_join(baseline_reg, whale_reg, by = ".metric") |>
+  mutate(
+    percent_change = 100 * (with_whale - baseline) / baseline
+  )
+
+whale_comparison |>
+  mutate(across(where(is.numeric), ~ round(.x, 2))) |>
+  gt()
+```
+
+**RMSE moves much more in percentage terms** because the outlying residual is squared. This makes RMSE appropriate when very large misses are especially damaging—for example, when severely underforecasting a major customer's order causes inventory or capacity problems. MAE is more robust and better represents the typical dollar error when occasional huge orders should not dominate the overall evaluation. In practice, I would report both: MAE for typical performance and RMSE as a warning about costly extreme misses.
+
+## Exercise 9.4 — Multiclass Averaging
+
+Re-run the multiclass `loyalty_tier` example using `estimator = "micro"` instead of the default macro averaging for `sens`. Also run it with `estimator = "macro_weighted"`. Compare all three numbers.
+
+1.  Why might micro-averaging look more favorable when one class (Bronze) is much larger than the others?
+2.  Which estimator would you choose if you wanted to ensure that **Platinum** customers — the rarest and most valuable tier — are not underrepresented in the metric? Explain your reasoning.
+3.  In a marketing context, which averaging method is most likely to give a misleadingly optimistic picture of model performance? Why?
+
+### Response
+
+```{r}
+#| label: multiclass-model
+#| code-summary: "Show multiclass model and averaging calculations"
+multi_rec <- recipe(loyalty_tier ~ age + income, data = mail_train) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+multi_spec <- multinom_reg() |> set_engine("nnet")
+multi_wf <- workflow() |> add_recipe(multi_rec) |> add_model(multi_spec)
+multi_fit <- fit(multi_wf, data = mail_train)
+multi_preds <- augment(multi_fit, new_data = mail_test)
+
+multi_sens <- bind_rows(
+  multi_preds |> sens(truth = loyalty_tier, estimate = .pred_class,
+                      estimator = "macro") |> mutate(estimator = "macro"),
+  multi_preds |> sens(truth = loyalty_tier, estimate = .pred_class,
+                      estimator = "macro_weighted") |> mutate(estimator = "macro_weighted"),
+  multi_preds |> sens(truth = loyalty_tier, estimate = .pred_class,
+                      estimator = "micro") |> mutate(estimator = "micro")
+) |>
+  select(estimator, sensitivity = .estimate)
+```
+
+```{r}
+#| label: tbl-multiclass
+#| tbl-cap: "Sensitivity under three multiclass averaging methods"
+multi_sens |>
+  mutate(sensitivity = round(sensitivity, 3)) |>
+  gt()
+```
+
+1.  **Micro-averaging** pools decisions across all observations, so the largest class contributes the most to the final value. When Bronze customers are much more common, strong performance on Bronze can outweigh poor performance on Gold or Platinum and make the result look favorable.
+2.  I would choose **macro averaging** when Platinum customers must not be underrepresented. Macro averaging computes the metric for each class and gives every class equal weight, so the rare Platinum tier counts as much as Bronze.
+3.  **Micro averaging** is most likely to look misleadingly optimistic in this context, because it reflects overall volume and can hide weak performance on a small, strategically valuable segment. Macro-weighted averaging can have a similar problem, although it is more explicit because it weights class results by prevalence.
+
+::: {.callout-warning title="Business implication"}
+No single average should replace class-level results when one small segment has unusually high value. For a loyalty campaign, I would also report Platinum sensitivity separately so decision-makers can see whether the model serves that customer group effectively.
+:::
+
+## GitHub Links
+
+- Published GitHub Pages Report: <https://brahhmen55.github.io/IBM6540/>
+- GitHub Repository: <https://github.com/Brahhmen55/IBM6540>
