@@ -1,0 +1,600 @@
+---
+title: "M05: Reflection on Odds, Log(Odds), Odds Ratio, and Log(OR)"
+author: "Luis Berumen"
+date: today
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 4
+    toc-expand: 2
+    number-sections: true
+    code-link: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    smooth-scroll: true
+editor: visual
+output-file: index.html
+execute:
+  echo: true
+  warning: false
+  message: false
+  freeze: auto
+---
+
+# Follow-Along Class Notes {.unnumbered}
+
+These notes redo the questions reviewed in class for the M05 Reflection on Logistic Fundamentals assignment. The goal is to preserve the prompt, code, expected answers, and rationale needed for exam review.
+
+::: {.callout-note title="Assignment focus"}
+The class recording reviewed Questions 1–9. I redid those questions below and organized them prompts, code, expected answers, and short explanations.
+:::
+
+# Setup {.unnumbered}
+
+```{r setup}
+library(tidymodels) # umbrella: rsample, recipes, parsnip, workflows, yardstick
+library(tidyverse)
+library(janitor) # clean_names()
+library(skimr) # skim()
+library(patchwork) # side-by-side plots
+
+tidymodels_prefer() # resolve function-name conflicts
+conflicted::conflicts_prefer(stats::fisher.test)
+conflicted::conflicts_prefer(stats::chisq.test)
+set.seed(2024)
+```
+
+# Report Features and Organization {.unnumbered}
+
+| Concept | Why it matters | Reviewed in |
+|------------------------|------------------------|------------------------|
+| Logarithms | Compress skewed values and isolate exponents | Q1–Q5 |
+| Odds | Compare events to non-events | Q6–Q7 |
+| Log(odds) / logit | Makes odds symmetric and usable in logistic regression | Q8–Q9 |
+
+::: {.callout-tip title="How to read this report"}
+Each question includes the original prompt first, followed by the R code and expected answer.
+:::
+
+# Marketing Dataset
+
+```{r load-data}
+# ── Synthetic direct-mail dataset ──────────────────────────────────────────────
+set.seed(123)
+n <- 3000
+
+mail_data <- tibble(
+  customer_id = paste0("C", str_pad(1:n, 5, pad = "0")),
+  age = round(rnorm(n, mean = 45, sd = 12)),
+  income = round(rlnorm(n, meanlog = 10.8, sdlog = 0.6)), # right-skewed
+  recency_days = round(rexp(n, rate = 1 / 60)), # days since last purchase
+  freq_12mo = rpois(n, lambda = 3), # purchases in 12 months
+  avg_order_amt = round(rlnorm(n, meanlog = 4.2, sdlog = 0.5), 2),
+  channel = sample(
+    c("email", "direct_mail", "digital"),
+    n,
+    replace = TRUE,
+    prob = c(0.5, 0.3, 0.2)
+  ),
+  region = sample(
+    c("West", "South", "Midwest", "Northeast"),
+    n,
+    replace = TRUE
+  ),
+  loyalty_tier = sample(
+    c("Bronze", "Silver", "Gold", "Platinum"),
+    n,
+    replace = TRUE,
+    prob = c(0.4, 0.3, 0.2, 0.1)
+  ),
+  responded = rbinom(
+    n,
+    1,
+    prob = plogis(
+      -3 +
+        0.02 * (age - 45) +
+        0.3 * log(income / 50000) +
+        0.1 * freq_12mo -
+        0.005 * recency_days
+    )
+  )
+) |>
+  mutate(
+    income = if_else(runif(n) < 0.08, NA_real_, income),
+    avg_order_amt = if_else(runif(n) < 0.05, NA_real_, avg_order_amt),
+    responded = factor(responded, levels = c(1, 0), labels = c("yes", "no"))
+  )
+
+glimpse(mail_data)
+```
+
+```{r skim-data}
+skim(mail_data)
+```
+
+```{r base-split-recipe-workflow}
+set.seed(617)
+
+mail_split <- initial_split(
+  mail_data,
+  prop = 0.80,
+  strata = responded
+)
+
+mail_train <- training(mail_split)
+mail_test <- testing(mail_split)
+
+mail_rec <- recipe(responded ~ ., data = mail_train) |>
+  update_role(customer_id, new_role = "ID") |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_log(income, avg_order_amt, recency_days, base = 10, offset = 1) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors())
+
+mail_prep <- prep(mail_rec)
+
+lr_spec <- logistic_reg(penalty = 0.01, mixture = 1) |>
+  set_engine("glmnet") |>
+  set_mode("classification")
+
+mail_wf <- workflow() |>
+  add_recipe(mail_rec) |>
+  add_model(lr_spec)
+
+mail_fit <- fit(mail_wf, data = mail_train)
+preds <- augment(mail_fit, new_data = mail_test)
+```
+
+# Questions Reviewed in Class {#sec-video-quizzes}
+
+## Step 1-1 — Logarithms
+
+### Q1 — What Does a Log Do?
+
+Complete the statement: "If $2^5 = 32$, then $\log_2(32) =$ \_\_\_\_ because..."
+
+Verify in R using `log(32, base = 2)`.
+
+Why is this useful when income values range from about \$7,000 to \$455,000?
+
+```{r q1-1, eval=FALSE}
+# Your code here
+log(32, base = 2)
+```
+
+#### Q1.1. Log
+
+**Complete statement:** "If $2^5 = 32$, then $\log_2(32) = 5$ because the logarithm tells us *the exponent we need to raise 2 to in order to get 32*."
+
+#### Q1.2. Verify
+
+```{r q1}
+log(32, base = 2)
+```
+
+**Expected answer:** 5
+
+#### Q1.3. Why?
+
+**Written answer:** Income ranges from approximately \$7K to \$455K, a ratio of about 65×. On the raw scale this spread makes linear modeling difficult because the data are highly right-skewed. A log transformation compresses the values into a much narrower range (approximately 3.8 to 5.7 using log base 10), making the relationship between income and response more linear.
+
+------------------------------------------------------------------------
+
+### Q2 — Multiplication Becomes Addition
+
+The video demonstrates:
+
+$$\log(a \times b) = \log(a) + \log(b).$$
+
+1.  Verify using `a = 4`, `b = 8` (base 2): compute both sides and confirm they are equal.
+2.  In logistic regression, we multiply many small probabilities together. Explain in one sentence why the log property above makes this computationally safer.
+
+```{r q1-2, eval=FALSE}
+log(32, base = 2)
+log(4 * 8, base = 2) # --> below
+log(4, base = 2) + log(8, base = 2)
+```
+
+#### Q2.1. Verify using `a = 4`, `b = 8` (base 2)
+
+```{r q2}
+log(4 * 8, base = 2)
+
+log(4, base = 2) + log(8, base = 2)
+```
+
+**Expected answer:** Both equal **5**, confirming the rule.
+
+#### Q2.2. Why is the log property computationally safer?
+
+**Written answer:** When multiplying many small probabilities (e.g., likelihoods), the product can underflow to zero in floating-point arithmetic. Log converts multiplication to addition, keeping the numbers in a stable numeric range—this is why the **log-likelihood** is maximized instead of the **likelihood** directly.
+
+------------------------------------------------------------------------
+
+### Q3 — Geometric Mean in Marketing
+
+The video shows the geometric mean is better than the arithmetic mean for data that **multiplies** rather than adds.
+
+Five customers' order values: \$10, \$20, \$80, \$40, \$1,000.
+
+1.  Compute the arithmetic mean with `mean()`.
+2.  Compute the geometric mean: `exp(mean(log(x)))`.
+3.  Which better represents the "typical" customer, and why does the \$1,000 order distort the arithmetic mean more?
+
+```{r q1-3, eval=FALSE}
+orders <- c(10, 20, 80, 40, 1000)
+mean(orders)
+exp(mean(log(orders)))
+```
+
+#### Q3.1. Compute the arithmetic mean with `mean()`
+
+```{r q3-arith}
+orders <- c(10, 20, 80, 40, 1000)
+mean(orders)
+exp(mean(log(orders)))
+```
+
+- Arithmetic mean: **230**
+
+#### Q3.2. Compute the geometric mean: `exp(mean(log(x)))`
+
+```{r q3-geom}
+exp(mean(log(orders)))
+```
+
+- Geometric mean: ≈ **57.7**
+
+#### Q3.3. Which better represents the "typical" customer?
+
+**Written answer:** \$56–\$57 is a much more representative "typical" order value than \$230, which is inflated by the single \$1,000 order. The arithmetic mean is strongly influenced by the extreme outlier, while the geometric mean works in log-space where the outlier is less extreme.
+
+------------------------------------------------------------------------
+
+### Q4 — Log(0) and the Offset
+
+The video explains $\log(0)$ is undefined (negative infinity).
+
+1.  Run `log(0)`: what does R return?
+2.  Your Week 2 recipe uses `step_log(..., offset = 1)`. Explain in one sentence why this offset is necessary.
+3.  What is `log(0 + 1)`? Why is adding 1 a safe lower bound?
+
+```{r q1-4, eval=FALSE}
+log(0)
+log(0 + 1)
+```
+
+#### Q4.1. Run `log(0)` — what does R return?
+
+```{r q4-1}
+log(0)
+```
+
+**Expected answer:**
+
+- `log(0)` returns `-Inf`.
+
+#### Q4.2. Why is `offset = 1` necessary?
+
+**Written answer:** The offset ensures that even a customer with zero recency days or zero order amount does not produce `-Inf` after log transformation, which would crash the model.
+
+```{r q4-2}
+log(0 + 1)
+```
+
+- `log(0 + 1)` = `log(1)` = **0**
+
+#### Q4.3. Why is adding 1 a safe lower bound?
+
+**Written answer:** `log(1) = 0` because any base raised to the power 0 equals 1. Adding 1 as a lower bound means the minimum possible log-transformed value is 0, not negative infinity—a safe, neutral floor.
+
+------------------------------------------------------------------------
+
+### Q5 — Base Conversion
+
+The video notes that base 2, base 10, and natural log all follow the same rules and differ only by a constant factor.
+
+1.  For income = \$49,021, compute `log2()`, `log10()`, and `log()` (natural).
+2.  Divide `log()` by `log10()`: what constant do you get?
+3.  After `step_normalize()` is applied in the recipe, does it matter which base was used for `step_log()`? Explain why or why not.
+
+```{r q1-5, eval=FALSE}
+income_val <- 49021
+log(income_val, base = 2)
+log10(income_val)
+log(income_val)
+
+# Ratio
+log(income_val) / log10(income_val)
+```
+
+#### Q5.1. For income = \$49,021, compute `log2()`, `log10()`, and `log()` (natural)
+
+```{r q5-1}
+income_val <- 49021
+
+log(income_val, base = 2)   # 15.58111 = log2(income_val)
+log10(income_val)           # 4.690382
+log(income_val)             # natural log = 10.8
+```
+
+**Expected answers:**
+
+- Base 2: ≈ **15.58**
+- Base 10: ≈ **4.69**
+- Natural: ≈ **10.80**
+
+#### Q5.2. Divide `log()` by `log10()` — what constant do you get?
+
+```{r q5-2}
+# Ratio
+log(income_val) / log10(income_val) # = 2.303
+log(10) # 2.303
+```
+
+```{r q5-2-alt}
+log(income_val, base = 2) / log10(income_val) # = 3.3219
+log(10, base = 2) # 3.3219
+log2(10) # 3.3219
+```
+
+**Expected answers:**
+
+- Ratio: ≈ **2.303** = `log(10)`
+- Base-2 ratio: ≈ **3.3219** = `log2(10)`
+
+#### Q5.3. After `step_normalize()` is applied in the recipe, does it matter which base was used for `step_log()`?
+
+**Written answer:** The ratio is the constant `log(10)` ≈ 2.303—any value in natural log equals its log10 value × 2.303. Since `step_normalize()` subtracts the mean and divides by the standard deviation, multiplying by a constant changes both the mean and SD proportionally, and the resulting z-scores are identical regardless of base.
+
+**What to look for:** Student must invoke `step_normalize()` explicitly, not just state "it doesn't matter."
+
+## Step 1-2 — Odds and Log(Odds)
+
+### Q6 — Probability vs. Odds
+
+The video distinguishes probability from odds.
+
+In `mail_data`, 142 customers responded ("yes") out of 3,000 total.
+
+1.  Compute the **probability** of responding:
+
+$$P(\text{respond}) = \frac{\text{yes}}{\text{total}}$$
+
+2.  Compute the **odds** of responding:
+
+$$\text{Odds} = \frac{\text{yes}}{\text{no}} = \frac{P}{1 - P}$$
+
+3.  In plain English, what does an odds of 0.05 mean for a marketer trying to interpret campaign response?
+
+```{r q2-1, eval=FALSE}
+yes <- 142
+no <- 3000 - 142
+
+# Probability
+p <- yes / (yes + no)
+p
+
+# Odds
+odds <- yes / no
+odds
+
+# Or equivalently
+p / (1 - p)
+```
+
+#### Q6.1. Compute the probability of responding
+
+```{r q6-1-prob}
+yes <- 142
+no <- 3000 - 142 # 2858
+
+p <- yes / (yes + no)
+cat("Probability:", round(p, 4), "\n")
+```
+
+**Expected answers:**
+
+- Probability: ≈ **0.0473** (4.73%)
+
+#### Q6.2. Compute the odds of responding
+
+```{r q6-2-odds}
+odds <- yes / no
+cat("Odds:", round(odds, 4), "\n")
+```
+
+**Expected answers:**
+
+- Odds: ≈ **0.0497**
+
+#### Q6.3. In plain English, what does an odds of 0.05 mean for a marketer trying to interpret campaign response?
+
+```{r q6-3}
+# 1/x = 0.05  ->  x = 1/0.05 = 20
+# 1/20 = 0.05
+```
+
+**Written answer:** Odds of 0.05 means that for every customer who responds, about 20 do not. A marketer might say: "We expect roughly 1 responder for every 20 non-responders mailed."
+
+**Common mistake:** Confusing probability (0.0473) and odds (0.0497). They are close when the event is rare but diverge substantially as probability increases. Worth demonstrating with Q7.
+
+------------------------------------------------------------------------
+
+### Q7 — Converting Between Probability and Odds
+
+The video shows you can derive odds from probabilities using
+
+$$\text{Odds} = \frac{P}{1-P}.$$
+
+1.  If a customer has a 20% chance of responding, what are their odds?
+2.  If a customer has a 50% chance, what are their odds?
+3.  If a customer has an 80% chance, what are their odds?
+4.  What pattern do you notice? What happens to odds as probability approaches 1?
+
+```{r q2-2, eval=FALSE}
+prob_to_odds <- function(p) p / (1 - p)
+
+prob_to_odds(0.20)
+prob_to_odds(0.50)
+prob_to_odds(0.80)
+```
+
+#### Q7.1. If a customer has a 20% chance of responding, what are their odds?
+
+```{r q7-1-odds}
+prob_to_odds <- function(p) p / (1 - p)
+prob_to_odds(0.20) # 0.25
+# 1 / x = 0.25  ->  x = 1 / 0.25 = 4
+```
+
+**Expected answers:**
+
+- P = 0.20 → odds = **0.25** (1 in 4 chance: 1 success per 4 failures)
+
+#### Q7.2. If a customer has a 50% chance, what are their odds?
+
+```{r q7-2-odds}
+prob_to_odds(0.50) # 1
+# 1 / x = 1  -->  x = 1 / 1 = 1
+```
+
+**Expected answers:**
+
+- P = 0.50 → odds = **1.00** (even odds: 1 success per 1 failure)
+
+#### Q7.3. If a customer has an 80% chance, what are their odds?
+
+```{r q7-3-odds}
+prob_to_odds(0.80) # = 4
+# X/1 = 4  -->  X = 4/1 = 4
+```
+
+**Expected answers:**
+
+- P = 0.80 → odds = **4.00** (4 successes per 1 failure)
+
+#### Q7.4. What pattern do you notice? What happens to odds as probability approaches 1?
+
+**Pattern:** As probability approaches 1, odds grow without bound toward infinity. The relationship is nonlinear and asymmetric—which is exactly the problem `log(odds)` fixes.
+
+------------------------------------------------------------------------
+
+### Q8 — Why Log(Odds)?
+
+The video explains that odds are **asymmetric**: odds against an event range 0 to 1, while odds in favor range 1 to infinity. Taking the log fixes this.
+
+1.  Compute `log(odds)` for probabilities 0.10, 0.50, and 0.90.
+2.  Verify that `log(odds)` at $P = 0.50$ equals exactly 0: why does this make sense intuitively?
+3.  Are the `log(odds)` values symmetric around 0? What does this symmetry mean for modeling?
+
+```{r q2-3, eval=FALSE}
+probs <- c(0.10, 0.50, 0.90)
+odds <- probs / (1 - probs)
+log_odds <- log(odds)
+
+tibble(probability = probs, odds = odds, log_odds = log_odds)
+```
+
+#### Q8.1. Compute `log(odds)` for probabilities 0.10, 0.50, and 0.90
+
+```{r q8}
+probs <- c(0.10, 0.50, 0.90)
+odds <- probs / (1 - probs)
+log_odds <- log(odds)
+
+tibble(probability = probs, odds = odds, log_odds = log_odds)
+```
+
+**Expected answers:**
+
+| probability |  odds | log_odds |
+|------------:|------:|---------:|
+|        0.10 | 0.111 |   -2.197 |
+|        0.50 | 1.000 |    0.000 |
+|        0.90 | 9.000 |    2.197 |
+
+#### Q8.2. Verify that `log(odds)` at $P = 0.50$ equals exactly 0
+
+**Written answer:** `log(odds)` at P = 0.50 is 0 because odds = 1 (equal chance of success and failure), and `log(1) = 0` for any base.
+
+#### Q8.3. Are the log(odds) values symmetric around 0? What does this symmetry mean for modeling?
+
+**Written answer:** Yes, the log(odds) values are symmetric: P = 0.10 gives -2.197 and P = 0.90 gives +2.197 (mirror images). This symmetry means a model can treat "more likely" and "less likely" on equal footing—difficult with raw odds because 0.111 and 9.000 are not symmetric around any meaningful center.
+
+------------------------------------------------------------------------
+
+### Q9 — The Logit Function
+
+The video introduces the **logit** as the log of the odds ratio, central to logistic regression.
+
+$$\text{logit}(P) = \log\left(\frac{P}{1-P}\right)$$
+
+1.  Using `mail_data`, compute the overall response rate (probability).
+2.  Convert it to log(odds) using the formula above.
+3.  In your Week 2 recipe, the model output `.pred_yes` is a probability. Write the R code to convert it to log(odds).
+
+```{r q2-4, eval=FALSE}
+# Overall response rate
+p_respond <- mean(mail_data$responded == "yes")
+p_respond
+
+# Convert to log(odds)
+log(p_respond / (1 - p_respond))
+```
+
+#### Q9.1. Using `mail_data`, compute the overall response rate (probability)
+
+```{r}
+#| label: q9-1-prob
+p_respond <- mean(mail_data$responded == "yes")
+cat("Response rate:", round(p_respond, 4), "\n")
+```
+
+**Expected answers:**
+
+- Response rate: ≈ **0.0473**
+
+#### Q9.2. Convert it to log(odds) using the formula above
+
+```{r}
+#| label: q9-2-log_odds
+log_odds_respond <- log(p_respond / (1 - p_respond))
+cat("Log(odds):", round(log_odds_respond, 3), "\n")
+```
+
+**Expected answers:**
+
+- Log(odds): ≈ **-3.002**
+
+#### Q9.3. In your Week 2 recipe, the model output `.pred_yes` is a probability. Write the R code to convert it to log(odds).
+
+**Code:**
+
+```{r q9-code}
+# Convert .pred_yes to log(odds)
+preds |>
+  mutate(log_odds = log(.pred_yes / (1 - .pred_yes))) |>
+  select(customer_id, .pred_yes, log_odds) |>
+  head()
+```
+
+**What to look for:** Student correctly identifies `plogis()` as the inverse of `log(p/(1-p))`—i.e., `plogis(log_odds)` gets back the probability.
+
+```{r q9-check}
+preds |>
+  mutate(log_odds = log(.pred_yes / (1 - .pred_yes))) |>
+  mutate(pred_check = plogis(log_odds)) |>
+  select(customer_id, .pred_yes, log_odds, pred_check) |>
+  head()
+```
+
+## GitHub Links
+
+- Published GitHub Pages Report: <https://brahhmen55.github.io/IBM6540/>
+- GitHub Repository: <https://github.com/Brahhmen55/IBM6540>
+
