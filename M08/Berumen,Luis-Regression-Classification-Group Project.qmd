@@ -1,0 +1,863 @@
+---
+title: "Reflection on Regression and Classification Models with Group Project Data"
+subtitle: "Analytics Objective: Predict Retail Sales Revenue"
+author: "Luis Berumen"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-expand: 1
+    toc-location: right-body
+    toc-title: "Contents"
+    number-sections: true
+    code-fold: show
+    code-overflow: wrap
+    code-tools: true
+    theme: cosmo
+    highlight-style: github
+    df-print: kable
+    embed-resources: true
+    smooth-scroll: true
+output-file: index.html
+execute:
+  warning: false
+  message: false
+  freeze: false
+editor: visual
+---
+
+```{r}
+#| label: global-setup
+#| include: false
+
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(tidymodels)
+library(glmnet)
+library(scales)
+library(knitr)
+library(patchwork)
+
+tidymodels_prefer()
+theme_set(theme_minimal(base_size = 14))
+set.seed(2026)
+
+# Locate the retail CSV inside the project folder.
+csv_files <- list.files(
+  ".",
+  pattern = "\\.csv$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+data_path <- csv_files[grepl("retail|sales", csv_files, ignore.case = TRUE)][1]
+if (is.na(data_path)) data_path <- csv_files[1]
+if (is.na(data_path)) stop("No CSV file was found in the project folder.")
+
+retail <- read_csv(data_path, show_col_types = FALSE) |>
+  clean_names() |>
+  mutate(
+    date = as.Date(date),
+    month = month(date, label = TRUE, abbr = TRUE),
+    year = factor(year(date)),
+    season = case_when(
+      month(date) %in% c(12, 1, 2) ~ "Winter",
+      month(date) %in% c(3, 4, 5)  ~ "Spring",
+      month(date) %in% c(6, 7, 8)  ~ "Summer",
+      TRUE                         ~ "Fall"
+    ),
+    season = factor(season, levels = c("Winter", "Spring", "Summer", "Fall")),
+    holiday = factor(
+      if_else(as.logical(holiday_effect), "Holiday", "Non-holiday")
+    ),
+    day = factor(
+      day_of_the_week,
+      levels = c(
+        "Monday", "Tuesday", "Wednesday", "Thursday",
+        "Friday", "Saturday", "Sunday"
+      )
+    ),
+    discount_group = case_when(
+      discount_percentage == 0  ~ "No discount",
+      discount_percentage <= 10 ~ "Low (1–10%)",
+      TRUE                      ~ "High (11–20%)"
+    ),
+    discount_group = factor(
+      discount_group,
+      levels = c("No discount", "Low (1–10%)", "High (11–20%)")
+    ),
+    product_category = factor(product_category)
+  ) |>
+  select(
+    sales_revenue_usd,
+    discount_percentage,
+    units_sold,
+    marketing_spend_usd,
+    product_category,
+    day,
+    holiday,
+    month,
+    season,
+    year
+  )
+
+reg_metrics <- metric_set(rmse, rsq, mae)
+```
+
+# Task 1 — Analytics Objective and Machine-Learning Approach
+
+### Analytics Objective
+
+My revised analytics objective is:
+
+> **Predict sales revenue from discount percentage and other relevant retail characteristics, compare multiple regression models, and identify the features that contribute most to prediction.**
+
+The original project objective focused on examining the relationship between discounts and revenue. For this assignment, I revised it into a prediction-focused objective because machine learning requires a clearly defined target that the model will predict.
+
+::: {.callout-note title="Customer-oriented business purpose"}
+The intended audience is a retail or ecommerce manager who needs an evidence-based way to estimate revenue under different promotional conditions. A useful model can support promotion planning, revenue forecasting, and decisions about when discounts should be paired with marketing support.
+:::
+
+This report follows the regression workflow demonstrated in Module 4: data splitting, recipe creation, model specification, fitting, evaluation, cross-validation, hyperparameter tuning, and feature-importance analysis.[^1]
+
+[^1]: The structure is adapted to the Group 1 retail sales dataset rather than the customer-lifetime-value example used in the course codebook.
+
+### Supervised or Unsupervised Learning
+
+This is a **supervised-learning** task because the dataset contains a known outcome—`sales_revenue_usd`—and the models learn from labeled historical observations to predict that outcome for unseen observations.
+
+Unsupervised methods such as clustering would instead search for hidden group structure without a labeled outcome. That is not the primary goal of this analytics objective.
+
+### Variables and Their Roles
+
+| Role | Variable | Reason for inclusion |
+|------------------------|------------------------|------------------------|
+| Outcome | `sales_revenue_usd` | Continuous dollar amount to predict |
+| Primary feature | `discount_percentage` | Central promotional variable in RO3 |
+| Feature | `units_sold` | Captures transaction volume |
+| Feature | `marketing_spend_usd` | Represents promotional support |
+| Feature | `product_category` | Allows revenue patterns to vary by product type |
+| Feature | `day` | Controls for day-of-week purchasing patterns |
+| Feature | `holiday` | Controls for holiday demand |
+| Feature | `month`, `season`, `year` | Controls for time and seasonal patterns |
+
+`store_id` and `product_id` are excluded because they function primarily as identifiers. `store_location` is also excluded from the main model because it contains many levels and could create a large, sparse collection of dummy variables that may distract from the promotion-focused objective.
+
+::: {.callout-warning title="Prediction timing and possible leakage"}
+`units_sold` is strongly connected to revenue and may only be known after a transaction occurs. Therefore, the main model predicts transaction-level revenue with all available transaction information. A sensitivity model without `units_sold` is also included to show how performance changes when the model is used earlier in the planning process.
+:::
+
+### Broader Machine-Learning Category
+
+The broader method is **regression** because the outcome variable is continuous. Classification methods would be appropriate only if the target were categorical, such as high versus low revenue.
+
+# Choose the Appropriate Codebook
+
+## Choose either the regression or classification codebook for your machine-learning task.
+
+I will use the **Module 4 — Regression-Focused Methods** codebook because my outcome variable, `sales_revenue_usd`, is continuous. The regression codebook matches this analytics objective and provides the workflow used in this report, including data splitting, recipe creation, model specification, model fitting, evaluation, regularization, tuning, 10-fold cross-validation, and feature-importance analysis.
+
+# Complete Machine-Learning Process
+
+## Pick a Machine-Learning Method and Explain Why It Would Be Best
+
+I selected **Elastic Net regression** as the initial candidate because this retail dataset includes predictors that may be correlated. For example, units sold, marketing spend, discount percentage, product category, and season may overlap in the information they provide about revenue. Elastic Net combines Ridge shrinkage with Lasso variable selection, making it a reasonable starting method when some predictors may be redundant but still contain useful signal.
+
+The Elastic Net objective combines the residual sum of squares with both L1 and L2 penalties:
+
+$$\text{Loss} = RSS + \lambda\left[\frac{1-\alpha}{2}\sum_j\beta_j^2 + \alpha\sum_j|\beta_j|\right]$$
+
+Here, $\lambda$ controls the overall penalty and $\alpha$ controls the mixture of Ridge and Lasso behavior.
+
+## Complete the Machine-Learning Process
+
+Go through the entire machine-learning process for the analytics objective, including data splitting, recipe creation, model specification, model fitting, model evaluation, and interpretation of the results.
+
+#### Set up the QMD file with appropriate libraries and data.
+
+The global setup chunk loads the tidyverse, tidymodels, glmnet, scales, knitr, and patchwork packages. The retail CSV is located automatically, imported, cleaned with `clean_names()`, and transformed using the same date, holiday, season, and discount logic used in the earlier Group 1 proposal.
+
+#### Data Overview
+
+```{r}
+#| label: tbl-data-overview
+#| tbl-cap: "Analysis dataset overview"
+
+retail |>
+  summarise(
+    observations = n(),
+    outcome_missing = sum(is.na(sales_revenue_usd)),
+    average_revenue = mean(sales_revenue_usd, na.rm = TRUE),
+    median_revenue = median(sales_revenue_usd, na.rm = TRUE),
+    average_discount = mean(discount_percentage, na.rm = TRUE),
+    average_units = mean(units_sold, na.rm = TRUE),
+    average_marketing_spend = mean(marketing_spend_usd, na.rm = TRUE)
+  ) |>
+  mutate(
+    average_revenue = dollar(average_revenue),
+    median_revenue = dollar(median_revenue),
+    average_discount = percent(average_discount / 100, accuracy = 0.1),
+    average_units = round(average_units, 2),
+    average_marketing_spend = dollar(average_marketing_spend)
+  ) |>
+  kable()
+```
+
+Table @tbl-data-overview confirms the sample size, outcome completeness, and central values used in the modeling workflow.
+
+#### Exploratory Relationship
+
+```{r}
+#| label: fig-discount-revenue
+#| fig-cap: "Discount percentage and sales revenue"
+#| fig-height: 5
+
+retail |>
+  ggplot(aes(discount_percentage, sales_revenue_usd)) +
+  geom_jitter(alpha = 0.10, width = 0.25, color = "#23351F") +
+  geom_smooth(method = "lm", se = FALSE, color = "#D9A441", linewidth = 1) +
+  scale_x_continuous(labels = label_percent(scale = 1)) +
+  scale_y_continuous(labels = label_dollar(scale_cut = cut_short_scale())) +
+  labs(
+    x = "Discount percentage",
+    y = "Sales revenue (USD)"
+  )
+```
+
+Figure @fig-discount-revenue provides an initial descriptive view. The predictive models below test whether discount percentage adds useful predictive information after accounting for transaction volume, marketing spend, product category, and timing variables.
+
+I reserve 20% of the observations as a final test set. The test set is not used for model selection or tuning. Ten-fold cross-validation is performed only within the training set.
+
+```{r}
+#| label: data-split
+
+set.seed(2026)
+retail_split <- initial_split(retail, prop = 0.80, strata = sales_revenue_usd)
+retail_train <- training(retail_split)
+retail_test  <- testing(retail_split)
+
+split_summary <- tibble(
+  sample = c("Training", "Test"),
+  observations = c(nrow(retail_train), nrow(retail_test)),
+  mean_revenue = c(
+    mean(retail_train$sales_revenue_usd),
+    mean(retail_test$sales_revenue_usd)
+  )
+) |>
+  mutate(mean_revenue = dollar(mean_revenue))
+
+kable(split_summary)
+```
+
+```{r}
+#| label: shared-recipe
+
+retail_rec <- recipe(sales_revenue_usd ~ ., data = retail_train) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_impute_mode(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_zv(all_predictors())
+
+retail_rec
+```
+
+The same shared recipe is used for OLS, Ridge, Lasso, and Elastic Net so that differences in performance reflect the models rather than inconsistent preprocessing.
+
+```{r}
+#| label: cv-folds
+
+set.seed(2026)
+retail_folds <- vfold_cv(retail_train, v = 10, strata = sales_revenue_usd)
+```
+
+### Model specification, fitting, and evaluation
+
+```{r}
+#| label: initial-enet
+
+initial_enet_spec <- linear_reg(penalty = 0.1, mixture = 0.5) |>
+  set_engine("glmnet")
+
+initial_enet_wf <- workflow() |>
+  add_recipe(retail_rec) |>
+  add_model(initial_enet_spec)
+
+initial_enet_fit <- fit(initial_enet_wf, data = retail_train)
+initial_enet_preds <- augment(initial_enet_fit, new_data = retail_test)
+initial_enet_metrics <- initial_enet_preds |>
+  reg_metrics(truth = sales_revenue_usd, estimate = .pred)
+
+initial_enet_metrics |>
+  mutate(.estimate = round(.estimate, 3)) |>
+  kable()
+```
+
+::: {.callout-tip title="How the metrics are interpreted"}
+- **RMSE:** typical prediction error in revenue dollars, with larger errors penalized more heavily; lower is better.
+- **MAE:** average absolute prediction error in revenue dollars; lower is better.
+- **R²:** proportion of outcome variation explained by the model; higher is better.
+:::
+
+```{r}
+#| label: fig-initial-residuals
+#| fig-cap: "Residuals from the initial Elastic Net model"
+#| fig-height: 5
+
+initial_enet_preds |>
+  mutate(residual = sales_revenue_usd - .pred) |>
+  ggplot(aes(.pred, residual)) +
+  geom_point(alpha = 0.18, color = "#23351F") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#D9A441") +
+  labs(
+    x = "Predicted sales revenue (USD)",
+    y = "Residual (actual − predicted)"
+  )
+```
+
+Figure @fig-initial-residuals is used to check whether residuals appear randomly distributed around zero or whether systematic patterns remain.
+
+### Interpretation of the Initial Model
+
+The initial Elastic Net model is evaluated with RMSE, MAE, and R² on the held-out test data. Lower RMSE and MAE indicate smaller prediction errors, while a higher R² indicates that the model explains more variation in sales revenue. The residual plot is also used to check whether prediction errors are centered around zero without an obvious systematic pattern.
+
+## Try Alternative Methods to Improve the Metrics
+
+I compare the initial Elastic Net model with four alternatives:
+
+1.  **OLS linear regression** as an interpretable baseline.
+2.  **Ridge regression** to shrink correlated coefficients while retaining every predictor.
+3.  **Lasso regression** to shrink coefficients and remove weak predictors.
+4.  **Polynomial Lasso regression** to capture possible curvature in discount, marketing spend, and units sold while controlling complexity through regularization.
+
+::: panel-tabset
+### OLS
+
+```{r}
+#| label: ols-model
+
+ols_spec <- linear_reg() |>
+  set_engine("lm")
+
+ols_wf <- workflow() |>
+  add_recipe(retail_rec) |>
+  add_model(ols_spec)
+
+ols_fit <- fit(ols_wf, data = retail_train)
+ols_preds <- augment(ols_fit, new_data = retail_test)
+ols_metrics <- ols_preds |>
+  reg_metrics(truth = sales_revenue_usd, estimate = .pred)
+
+ols_metrics |> kable()
+```
+
+### Ridge
+
+```{r}
+#| label: ridge-model
+
+ridge_spec <- linear_reg(penalty = 0.1, mixture = 0) |>
+  set_engine("glmnet")
+
+ridge_wf <- workflow() |>
+  add_recipe(retail_rec) |>
+  add_model(ridge_spec)
+
+ridge_fit <- fit(ridge_wf, data = retail_train)
+ridge_preds <- augment(ridge_fit, new_data = retail_test)
+ridge_metrics <- ridge_preds |>
+  reg_metrics(truth = sales_revenue_usd, estimate = .pred)
+
+ridge_metrics |> kable()
+```
+
+### Lasso
+
+```{r}
+#| label: lasso-model
+
+lasso_spec <- linear_reg(penalty = 0.1, mixture = 1) |>
+  set_engine("glmnet")
+
+lasso_wf <- workflow() |>
+  add_recipe(retail_rec) |>
+  add_model(lasso_spec)
+
+lasso_fit <- fit(lasso_wf, data = retail_train)
+lasso_preds <- augment(lasso_fit, new_data = retail_test)
+lasso_metrics <- lasso_preds |>
+  reg_metrics(truth = sales_revenue_usd, estimate = .pred)
+
+lasso_metrics |> kable()
+```
+
+### Polynomial + Lasso
+
+```{r}
+#| label: poly-model
+
+poly_rec <- recipe(sales_revenue_usd ~ ., data = retail_train) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_impute_mode(all_nominal_predictors()) |>
+  step_poly(
+    discount_percentage,
+    marketing_spend_usd,
+    units_sold,
+    degree = 2
+  ) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_zv(all_predictors())
+
+poly_wf <- workflow() |>
+  add_recipe(poly_rec) |>
+  add_model(lasso_spec)
+
+poly_fit <- fit(poly_wf, data = retail_train)
+poly_preds <- augment(poly_fit, new_data = retail_test)
+poly_metrics <- poly_preds |>
+  reg_metrics(truth = sales_revenue_usd, estimate = .pred)
+
+poly_metrics |> kable()
+```
+
+### 
+:::
+
+The manually selected Elastic Net values (`penalty = 0.1`, `mixture = 0.5`) are only starting points. I tune both parameters with a regular grid and select the combination with the lowest cross-validated RMSE.
+
+```{r}
+#| label: enet-tuning
+#| cache: true
+
+set.seed(2026)
+
+tuned_enet_spec <- linear_reg(
+  penalty = tune(),
+  mixture = tune()
+) |>
+  set_engine("glmnet")
+
+tuned_enet_wf <- workflow() |>
+  add_recipe(retail_rec) |>
+  add_model(tuned_enet_spec)
+
+enet_grid <- grid_regular(
+  penalty(range = c(-4, 1)),
+  mixture(),
+  levels = c(5, 5)
+)
+
+enet_tune_results <- tune_grid(
+  tuned_enet_wf,
+  resamples = retail_folds,
+  grid = enet_grid,
+  metrics = reg_metrics,
+  control = control_grid(save_pred = TRUE)
+)
+
+best_enet <- select_best(enet_tune_results, metric = "rmse")
+best_enet |> kable()
+```
+
+```{r}
+#| label: fig-enet-tuning
+#| fig-cap: "Elastic Net tuning results across penalty and mixture values"
+#| fig-height: 6
+
+autoplot(enet_tune_results) +
+  labs(
+    title = NULL,
+    subtitle = "Ten-fold cross-validation; lower RMSE and MAE are better"
+  )
+```
+
+```{r}
+#| label: final-enet
+
+final_enet_wf <- finalize_workflow(tuned_enet_wf, best_enet)
+final_enet_fit <- fit(final_enet_wf, data = retail_train)
+final_enet_preds <- augment(final_enet_fit, new_data = retail_test)
+final_enet_metrics <- final_enet_preds |>
+  reg_metrics(truth = sales_revenue_usd, estimate = .pred)
+
+final_enet_metrics |> kable()
+```
+
+I fit a second tuned Elastic Net model without `units_sold`. This answers a more operational question: how well can revenue be predicted before the final number of units sold is known?
+
+```{r}
+#| label: no-units-model
+#| cache: true
+
+retail_no_units <- retail |> select(-units_sold)
+
+set.seed(2026)
+no_units_split <- initial_split(
+  retail_no_units,
+  prop = 0.80,
+  strata = sales_revenue_usd
+)
+no_units_train <- training(no_units_split)
+no_units_test <- testing(no_units_split)
+
+no_units_rec <- recipe(sales_revenue_usd ~ ., data = no_units_train) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_impute_mode(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_zv(all_predictors())
+
+set.seed(2026)
+no_units_folds <- vfold_cv(no_units_train, v = 10, strata = sales_revenue_usd)
+
+no_units_wf <- workflow() |>
+  add_recipe(no_units_rec) |>
+  add_model(tuned_enet_spec)
+
+no_units_tune <- tune_grid(
+  no_units_wf,
+  resamples = no_units_folds,
+  grid = enet_grid,
+  metrics = reg_metrics
+)
+
+no_units_best <- select_best(no_units_tune, metric = "rmse")
+no_units_final_wf <- finalize_workflow(no_units_wf, no_units_best)
+no_units_fit <- fit(no_units_final_wf, data = no_units_train)
+no_units_preds <- augment(no_units_fit, new_data = no_units_test)
+no_units_metrics <- no_units_preds |>
+  reg_metrics(truth = sales_revenue_usd, estimate = .pred)
+
+bind_rows(
+  final_enet_metrics |> mutate(model = "Tuned Elastic Net — with units sold"),
+  no_units_metrics |> mutate(model = "Tuned Elastic Net — without units sold")
+) |>
+  select(model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  mutate(
+    rmse = dollar(rmse),
+    mae = dollar(mae),
+    rsq = percent(rsq, accuracy = 0.1)
+  ) |>
+  kable(col.names = c("Model", "RMSE", "R²", "MAE"))
+```
+
+A meaningful performance decline without `units_sold` would show that transaction volume carries substantial predictive information. The reduced model may still be more useful for planning because its features are more likely to be available before sales occur.
+
+## Compare All Methods Using 10-Fold Cross-Validation
+
+Every fixed model is compared using the same 10 folds. The tuned Elastic Net result comes directly from the tuning resamples at its selected parameter combination.
+
+```{r}
+#| label: cv-comparison
+#| cache: true
+
+cv_metrics <- function(wf, label) {
+  fit_resamples(
+    wf,
+    resamples = retail_folds,
+    metrics = reg_metrics,
+    control = control_resamples(save_pred = TRUE)
+  ) |>
+    collect_metrics() |>
+    mutate(model = label)
+}
+
+ols_cv <- cv_metrics(ols_wf, "OLS Linear")
+ridge_cv <- cv_metrics(ridge_wf, "Ridge (fixed)")
+lasso_cv <- cv_metrics(lasso_wf, "Lasso (fixed)")
+enet_cv <- cv_metrics(initial_enet_wf, "Elastic Net (fixed)")
+poly_cv <- cv_metrics(poly_wf, "Polynomial + Lasso")
+
+tuned_enet_cv <- collect_metrics(enet_tune_results) |>
+  semi_join(best_enet, by = c("penalty", "mixture")) |>
+  mutate(model = "Elastic Net (tuned)")
+
+all_cv <- bind_rows(
+  ols_cv,
+  ridge_cv,
+  lasso_cv,
+  enet_cv,
+  poly_cv,
+  tuned_enet_cv
+)
+```
+
+```{r}
+#| label: tbl-cv-results
+#| tbl-cap: "Ten-fold cross-validation performance for all regression models"
+
+all_cv |>
+  select(model, .metric, mean, std_err) |>
+  mutate(
+    mean = round(mean, 4),
+    std_err = round(std_err, 4)
+  ) |>
+  arrange(.metric, desc(.metric == "rsq"), mean) |>
+  kable()
+```
+
+```{r}
+#| label: fig-cv-rmse
+#| fig-cap: "Ten-fold cross-validation RMSE comparison"
+#| fig-height: 5.5
+
+all_cv |>
+  filter(.metric == "rmse") |>
+  ggplot(aes(reorder(model, mean), mean)) +
+  geom_col(fill = "#23351F", alpha = 0.88) +
+  geom_errorbar(
+    aes(ymin = mean - std_err, ymax = mean + std_err),
+    width = 0.25,
+    color = "#D9A441",
+    linewidth = 0.9
+  ) +
+  coord_flip() +
+  scale_y_continuous(labels = label_dollar()) +
+  labs(
+    x = NULL,
+    y = "Mean cross-validated RMSE"
+  )
+```
+
+Figure @fig-cv-rmse identifies the model with the lowest average cross-validated RMSE. Differences should be interpreted together with the standard-error bars. If two models have substantially overlapping error bars, the simpler model may be preferable because its performance is not meaningfully worse.
+
+```{r}
+#| label: test-comparison
+
+bind_rows(
+  ols_metrics |> mutate(model = "OLS Linear"),
+  ridge_metrics |> mutate(model = "Ridge (fixed)"),
+  lasso_metrics |> mutate(model = "Lasso (fixed)"),
+  initial_enet_metrics |> mutate(model = "Elastic Net (fixed)"),
+  poly_metrics |> mutate(model = "Polynomial + Lasso"),
+  final_enet_metrics |> mutate(model = "Elastic Net (tuned)")
+) |>
+  select(model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(rmse) |>
+  mutate(
+    rmse = dollar(rmse),
+    mae = dollar(mae),
+    rsq = percent(rsq, accuracy = 0.1)
+  ) |>
+  kable(
+    col.names = c("Model", "RMSE", "R²", "MAE")
+  )
+```
+
+::: {.callout-important title="Interpretation to finalize after rendering"}
+After the report renders, identify the lowest-RMSE model in Table @tbl-cv-results and explain whether the result is reasonable. A tuned or regularized model should outperform OLS only when shrinkage, variable selection, or nonlinear terms improve generalization. If the metrics are nearly identical, that would suggest the underlying revenue relationship is already captured well by a simple linear structure.
+:::
+
+## Produce and Interpret a Feature-Importance Chart
+
+For the finalized Elastic Net model, feature importance is represented by the absolute magnitude of standardized coefficients. Because the recipe normalizes numeric predictors, coefficient magnitudes are more comparable than they would be on the original scales.
+
+```{r}
+#| label: fig-feature-importance
+#| fig-cap: "Feature importance from the tuned Elastic Net model"
+#| fig-height: 6
+
+importance_tbl <- final_enet_fit |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  filter(term != "(Intercept)", estimate != 0) |>
+  mutate(importance = abs(estimate)) |>
+  slice_max(importance, n = 15) |>
+  arrange(importance)
+
+importance_tbl |>
+  ggplot(aes(importance, reorder(term, importance))) +
+  geom_col(fill = "#23351F", alpha = 0.88) +
+  labs(
+    x = "Absolute standardized coefficient",
+    y = NULL
+  )
+```
+
+The result is reasonable if `units_sold` ranks highly because revenue normally increases with transaction volume. Discount percentage and marketing spend may also matter, although their importance should be interpreted as predictive rather than causal. If `units_sold` dominates the chart, that also reinforces the earlier warning that the strongest model may be most useful for transaction-level estimation rather than advance promotion planning.
+
+# Five Questions from Module 4
+
+The following five exercises correspond to the questions at the end of the Module 4 regression codebook and are answered using the Group 1 retail sales data.
+
+## Exercise 4.1 — Ridge vs. Lasso Coefficient Behavior
+
+Fit Ridge (`mixture = 0`) and Lasso (`mixture = 1`) with an identical large penalty of `penalty = 10`. Compare zero coefficients, examine how Ridge shrinks a predictor that Lasso removes, and explain why Lasso may be preferred when there are 50+ potential predictors.
+
+The following models use the same large penalty so their coefficient behavior can be compared directly.
+
+```{r}
+#| label: exercise-ridge-lasso
+
+ridge_large_wf <- workflow() |>
+  add_recipe(retail_rec) |>
+  add_model(
+    linear_reg(penalty = 10, mixture = 0) |>
+      set_engine("glmnet")
+  )
+
+lasso_large_wf <- workflow() |>
+  add_recipe(retail_rec) |>
+  add_model(
+    linear_reg(penalty = 10, mixture = 1) |>
+      set_engine("glmnet")
+  )
+
+ridge_large_fit <- fit(ridge_large_wf, retail_train)
+lasso_large_fit <- fit(lasso_large_wf, retail_train)
+
+coef_comparison <- bind_rows(
+  ridge_large_fit |>
+    extract_fit_parsnip() |>
+    tidy() |>
+    mutate(model = "Ridge"),
+  lasso_large_fit |>
+    extract_fit_parsnip() |>
+    tidy() |>
+    mutate(model = "Lasso")
+) |>
+  filter(term != "(Intercept)")
+
+coef_comparison |>
+  group_by(model) |>
+  summarise(
+    zero_coefficients = sum(estimate == 0),
+    nonzero_coefficients = sum(estimate != 0),
+    .groups = "drop"
+  ) |>
+  kable()
+```
+
+Ridge should retain every predictor while shrinking its coefficient. Lasso can set coefficients exactly to zero, producing a smaller model. For a marketing manager facing 50 or more possible predictors, Lasso may be preferred when the goal is a simpler model that highlights a manageable set of signals.
+
+## Exercise 4.2 — Elastic Net Mixing Parameter
+
+Fit Elastic Net models with `penalty = 0.1` and `mixture` values of 0.25, 0.50, and 0.75. Compare nonzero coefficients and test RMSE, explain what changes as `mixture` increases, identify the best value, and explain when Elastic Net may be preferred over pure Lasso.
+
+```{r}
+#| label: exercise-mixtures
+#| cache: true
+
+mixture_values <- c(0.25, 0.50, 0.75)
+
+mixture_results <- map_dfr(mixture_values, function(mix) {
+  spec <- linear_reg(penalty = 0.1, mixture = mix) |>
+    set_engine("glmnet")
+  wf <- workflow() |>
+    add_recipe(retail_rec) |>
+    add_model(spec)
+  fit_obj <- fit(wf, retail_train)
+  preds <- augment(fit_obj, retail_test)
+  nonzero <- fit_obj |>
+    extract_fit_parsnip() |>
+    tidy() |>
+    filter(term != "(Intercept)") |>
+    summarise(n = sum(estimate != 0)) |>
+    pull(n)
+  preds |>
+    reg_metrics(truth = sales_revenue_usd, estimate = .pred) |>
+    mutate(mixture = mix, nonzero_coefficients = nonzero)
+})
+
+mixture_results |>
+  filter(.metric == "rmse") |>
+  select(mixture, nonzero_coefficients, test_rmse = .estimate) |>
+  mutate(test_rmse = dollar(test_rmse)) |>
+  kable()
+```
+
+As the mixture approaches one, the model behaves more like Lasso and may retain fewer predictors. Elastic Net is preferable to pure Lasso when correlated predictors—such as related seasonal or promotion variables—should be stabilized rather than forcing the model to select only one member of a correlated group.
+
+## Exercise 4.3 — Polynomial Degree Selection
+
+Compare cross-validated RMSE for polynomial degrees 1, 2, and 3. Explain whether degree 3 improves performance and discuss why higher-degree polynomial models may overfit without sufficient regularization.
+
+```{r}
+#| label: exercise-poly-degree
+#| cache: true
+
+make_poly_wf <- function(degree) {
+  rec <- recipe(sales_revenue_usd ~ ., data = retail_train) |>
+    step_impute_median(all_numeric_predictors()) |>
+    step_impute_mode(all_nominal_predictors()) |>
+    step_poly(
+      discount_percentage,
+      marketing_spend_usd,
+      units_sold,
+      degree = degree
+    ) |>
+    step_dummy(all_nominal_predictors()) |>
+    step_normalize(all_numeric_predictors()) |>
+    step_zv(all_predictors())
+
+  workflow() |>
+    add_recipe(rec) |>
+    add_model(lasso_spec)
+}
+
+poly_degree_cv <- map_dfr(1:3, function(d) {
+  cv_metrics(make_poly_wf(d), paste0("Polynomial degree ", d))
+})
+
+poly_degree_cv |>
+  filter(.metric == "rmse") |>
+  select(model, mean, std_err) |>
+  arrange(mean) |>
+  kable()
+```
+
+If degree three does not improve cross-validated RMSE beyond degree two, the added curvature is not justified. Higher-degree terms increase flexibility and therefore increase overfitting risk unless regularization and cross-validation show that the added complexity improves generalization.
+
+## Exercise 4.4 — Tuning Elastic Net
+
+Tune both `penalty` and `mixture` for Elastic Net using a regular grid with 5 levels each. Report the number of model fits across 10 folds, identify the best parameter combination, and discuss whether tuning both parameters is worth the added complexity.
+
+The tuned Elastic Net analysis above uses 5 penalty levels and 5 mixture levels. This produces $5 \times 5 = 25$ parameter combinations. With 10 folds, the tuning procedure requires $25 \times 10 = 250$ resampled model fits.
+
+```{r}
+#| label: exercise-enet-best
+
+best_enet |>
+  mutate(
+    penalty = signif(penalty, 4),
+    mixture = round(mixture, 2)
+  ) |>
+  kable()
+```
+
+The selected mixture indicates whether the best result is closer to Ridge (`mixture = 0`) or Lasso (`mixture = 1`). The additional complexity is worthwhile only if tuned Elastic Net produces a meaningful RMSE improvement over fixed or tuned Lasso.
+
+## Exercise 4.5 — Business Interpretation
+
+Use the feature-importance results to identify the most important predictors, discuss their direction and business meaning, consider why an expected predictor may be excluded, and identify the most actionable business lever while distinguishing prediction from causation.
+
+```{r}
+#| label: exercise-top-features
+
+importance_tbl |>
+  slice_max(importance, n = 10) |>
+  select(term, estimate, importance) |>
+  arrange(desc(importance)) |>
+  mutate(
+    direction = if_else(estimate > 0, "Positive", "Negative"),
+    estimate = round(estimate, 3),
+    importance = round(importance, 3)
+  ) |>
+  kable(
+    col.names = c("Feature", "Coefficient", "Importance", "Direction")
+  )
+```
+
+The three highest-ranked features should be discussed after rendering the table. For each one, I will explain its direction and whether the pattern makes business sense. An important distinction is that predictive importance does not prove that changing a feature will cause revenue to change.
+
+The most actionable lever should come from a variable the business can influence, such as discount percentage or marketing spend, rather than a variable it merely observes, such as season or realized units sold. Any recommendation must also consider the direction of the coefficient and the possibility that the feature is correlated with other predictors.
+
+# Publish the HTML Report to GitHub Pages
+
+- Published GitHub Pages Report: <https://brahhmen55.github.io/IBM6540/>
+- GitHub Repository: <https://github.com/Brahhmen55/IBM6540>
