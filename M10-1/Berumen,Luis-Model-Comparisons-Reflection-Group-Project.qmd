@@ -1,0 +1,780 @@
+---
+title: "Reflection on Ensembles, Model Comparisons with, and Interpretations with Group Project Data"
+subtitle: "Analytics Objective: Predict High vs. Low Retail Sales Revenue and Evaluate the Role of Discounts"
+author: "Luis Berumen"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-expand: 1
+    toc-location: right-body
+    toc-title: "Contents"
+    number-sections: true
+    code-fold: show
+    code-overflow: wrap
+    code-tools: true
+    theme: cosmo
+    highlight-style: github
+    df-print: paged
+    embed-resources: true
+    smooth-scroll: true
+output-file: index.html
+execute:
+  warning: false
+  message: false
+  freeze: true
+editor: visual
+---
+
+```{r}
+#| label: global-setup
+#| include: false
+
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(lubridate)
+library(tidymodels)
+library(glmnet)
+library(rpart)
+library(ranger)
+library(xgboost)
+library(DALEX)
+library(DALEXtra)
+library(scales)
+library(knitr)
+library(purrr)
+
+tidymodels_prefer()
+theme_set(theme_minimal(base_size = 14))
+set.seed(2026)
+
+# ---- Data import ---------------------------------------------------------
+xlsx_files <- list.files(
+  ".",
+  pattern = "\\.xlsx$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+data_path <- xlsx_files[grepl("retail|sales", xlsx_files, ignore.case = TRUE)][1]
+if (is.na(data_path)) data_path <- xlsx_files[1]
+if (is.na(data_path)) stop("No Excel (.xlsx) file was found in the project folder.")
+
+retail_raw <- read_excel(data_path) |>
+  clean_names()
+
+# ---- Outcome construction ------------------------------------------------
+revenue_cutoff <- median(retail_raw$sales_revenue_usd, na.rm = TRUE)
+
+retail <- retail_raw |>
+  mutate(
+    revenue_class = factor(
+      if_else(sales_revenue_usd > revenue_cutoff, "high", "low"),
+      levels = c("high", "low")
+    ),
+    date = as.Date(date),
+    month = factor(month(date, label = TRUE, abbr = TRUE)),
+    year = factor(year(date)),
+    season = case_when(
+      month(date) %in% c(12, 1, 2) ~ "Winter",
+      month(date) %in% c(3, 4, 5)  ~ "Spring",
+      month(date) %in% c(6, 7, 8)  ~ "Summer",
+      TRUE                         ~ "Fall"
+    ),
+    season = factor(season, levels = c("Winter", "Spring", "Summer", "Fall")),
+    holiday = factor(if_else(holiday_effect, "Holiday", "Non-holiday")),
+    day = factor(
+      day_of_the_week,
+      levels = c(
+        "Monday", "Tuesday", "Wednesday", "Thursday",
+        "Friday", "Saturday", "Sunday"
+      )
+    ),
+    product_category = factor(product_category)
+  ) |>
+  select(
+    revenue_class,
+    discount_percentage,
+    units_sold,
+    marketing_spend_usd,
+    product_category,
+    day,
+    holiday,
+    month,
+    season,
+    year
+  )
+
+class_metrics <- metric_set(roc_auc, accuracy, sens, spec)
+```
+
+::: {.callout-note title="One-time package setup"}
+If R reports that an interpretation package is missing, run this once in the Console and then render again:
+
+``` r
+install.packages(c(
+  "tidyverse", "readxl", "janitor", "lubridate", "tidymodels",
+  "glmnet", "rpart", "ranger", "xgboost", "DALEX", "DALEXtra"
+))
+```
+:::
+
+# Task 1 — State the Analytics Objective
+
+**State your AO (Analytics Objective) for your project. If your AO did not involve machine learning, revise it so that the objective is appropriately stated for a machine-learning task. What variables will be included and what are their roles? Is the broader category regression or classification?**
+
+## Response
+
+My original Group Project **AO 3** examined the relationship between **Discount Percentage** and **Sales Revenue** while accounting for other retail characteristics. For the ensemble-learning assignment, I retain the same business focus but express it as a supervised classification task:
+
+> **Predict whether a retail transaction will generate high or low Sales Revenue and evaluate whether Discount Percentage remains an important predictor after accounting for Units Sold, Marketing Spend, Product Category, season, day of week, and holiday status.**
+
+A transaction is classified as **high revenue** when its Sales Revenue is above the dataset median and **low revenue** otherwise. The cutoff used in this report is **`r dollar(revenue_cutoff)`**.
+
+### Variables and Roles
+
+| Role | Variable | Business meaning |
+|------------------------|------------------------|------------------------|
+| Outcome | `revenue_class` | High vs. low Sales Revenue |
+| Primary feature | `discount_percentage` | Discount level applied to the transaction |
+| Feature | `units_sold` | Transaction volume |
+| Feature | `marketing_spend_usd` | Marketing support |
+| Feature | `product_category` | Product/category differences |
+| Feature | `day` | Day-of-week pattern |
+| Feature | `holiday` | Holiday effect |
+| Feature | `month`, `season`, `year` | Seasonal/time effects |
+
+The broader machine-learning category is **classification** because the model predicts one of two classes: high or low revenue.
+
+`store_id` and `product_id` are not used because they primarily identify observations rather than describe the business conditions of interest. `store_location` is also excluded from the main model to keep the AO centered on discounting, product, marketing, and timing characteristics.
+
+# Task 2 — Bagging and Boosting
+
+**Refer to the Bagging and Boosting methods explained in Trees and Ensembles Part 2.**
+
+## Response
+
+A single decision tree is easy to interpret, but it can have high variance. **Random Forest** addresses this weakness through **bagging (bootstrap aggregating)**. Many trees are built from bootstrap samples, and predictions are aggregated. Random Forest also introduces **feature randomness** at each split, which helps make the trees less correlated.
+
+**Boosting** takes a different approach. Rather than fitting trees independently, boosted trees are built **sequentially**. Each new tree focuses on improving errors left by the current ensemble. XGBoost uses this boosting logic together with regularization and tuning parameters such as tree depth, learning rate, and number of trees.
+
+::: {.callout-tip title="Why both are useful"}
+Random Forest mainly reduces variance by averaging many decorrelated trees. XGBoost builds a sequence of weak trees that progressively correct errors. Both can capture nonlinearities and interactions that a linear classifier may miss.
+:::
+
+# Task 3 — Machine-Learning Process
+
+**Run four machine-learning methods: Regularized Logistic Regression, a Decision Tree with tuned hyperparameters, a Random Forest, and XGBoost. Complete data splitting, recipe creation, model specification, model fitting, model evaluation, and interpretation.**
+
+# Data Overview
+
+```{r}
+#| label: tbl-data-overview
+#| tbl-cap: "Retail classification dataset overview"
+
+retail |>
+  summarise(
+    observations = n(),
+    high_revenue = sum(revenue_class == "high"),
+    low_revenue = sum(revenue_class == "low"),
+    median_revenue_cutoff = revenue_cutoff,
+    average_discount = mean(discount_percentage, na.rm = TRUE),
+    average_units_sold = mean(units_sold, na.rm = TRUE),
+    average_marketing_spend = mean(marketing_spend_usd, na.rm = TRUE)
+  ) |>
+  mutate(
+    median_revenue_cutoff = dollar(median_revenue_cutoff),
+    average_discount = percent(average_discount / 100, accuracy = 0.1),
+    average_units_sold = round(average_units_sold, 2),
+    average_marketing_spend = dollar(average_marketing_spend)
+  ) |>
+  kable()
+```
+
+# Data Splitting
+
+```{r}
+#| label: split-data
+
+set.seed(2026)
+
+retail_split <- initial_split(
+  retail,
+  prop = 0.80,
+  strata = revenue_class
+)
+
+retail_train <- training(retail_split)
+retail_test  <- testing(retail_split)
+
+set.seed(2026)
+
+retail_folds <- vfold_cv(
+  retail_train,
+  v = 10,
+  strata = revenue_class
+)
+
+tibble(
+  sample = c("Training", "Testing"),
+  observations = c(nrow(retail_train), nrow(retail_test)),
+  high_revenue_rate = c(
+    mean(retail_train$revenue_class == "high"),
+    mean(retail_test$revenue_class == "high")
+  )
+) |>
+  mutate(high_revenue_rate = percent(high_revenue_rate, accuracy = 0.1)) |>
+  kable()
+```
+
+I use an **80/20 stratified train/test split** and create **10 stratified cross-validation folds** from the training set. The holdout test set is not used to select hyperparameters.
+
+# Recipe Creation
+
+I use two recipes. The tree-based models do not require normalization, while regularized logistic regression benefits from normalized numeric predictors because its penalty depends on coefficient magnitude.
+
+::: panel-tabset
+## Tree/Ensemble Recipe
+
+```{r}
+tree_rec <- recipe(revenue_class ~ ., data = retail_train) |>
+  step_unknown(all_nominal_predictors()) |>
+  step_novel(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
+  step_zv(all_predictors())
+
+tree_rec
+```
+
+## Lasso Logistic Recipe
+
+```{r}
+lasso_rec <- recipe(revenue_class ~ ., data = retail_train) |>
+  step_unknown(all_nominal_predictors()) |>
+  step_novel(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_zv(all_predictors())
+
+lasso_rec
+```
+:::
+
+# Model 1 — Lasso Logistic Regression
+
+**Run a regression- or classification-focused method and include it in the model comparison.**
+
+Lasso Logistic Regression is the baseline classification model. It assumes an additive relationship on the log-odds scale and uses an L1 penalty to shrink or remove less useful coefficients.
+
+```{r}
+#| label: tune-lasso
+
+lasso_spec <- logistic_reg(
+  mode = "classification",
+  penalty = tune(),
+  mixture = 1
+) |>
+  set_engine("glmnet")
+
+lasso_wf <- workflow() |>
+  add_recipe(lasso_rec) |>
+  add_model(lasso_spec)
+
+lasso_grid <- grid_regular(
+  penalty(range = c(-5, 0)),
+  levels = 10
+)
+
+set.seed(2026)
+
+lasso_tune <- tune_grid(
+  lasso_wf,
+  resamples = retail_folds,
+  grid = lasso_grid,
+  metrics = metric_set(roc_auc),
+  control = control_grid(save_pred = FALSE)
+)
+
+best_lasso <- select_best(lasso_tune, metric = "roc_auc")
+
+final_lasso_wf <- finalize_workflow(lasso_wf, best_lasso)
+
+set.seed(2026)
+
+lasso_cv <- fit_resamples(
+  final_lasso_wf,
+  resamples = retail_folds,
+  metrics = metric_set(roc_auc),
+  control = control_resamples(save_pred = FALSE)
+)
+```
+
+# Model 2 — Tuned Decision Tree
+
+**Run a Decision Tree with tuned hyperparameters.**
+
+I tune `cost_complexity`, `tree_depth`, and `min_n`. These parameters control pruning, maximum depth, and the minimum observations needed for further splitting.
+
+```{r}
+#| label: tune-tree
+
+dt_spec <- decision_tree(
+  mode = "classification",
+  cost_complexity = tune(),
+  tree_depth = tune(),
+  min_n = tune()
+) |>
+  set_engine("rpart")
+
+dt_wf <- workflow() |>
+  add_recipe(tree_rec) |>
+  add_model(dt_spec)
+
+set.seed(2026)
+
+dt_grid <- grid_latin_hypercube(
+  cost_complexity(range = c(-4, -1)),
+  tree_depth(range = c(2L, 10L)),
+  min_n(range = c(5L, 40L)),
+  size = 5
+)
+
+set.seed(2026)
+
+dt_tune <- tune_grid(
+  dt_wf,
+  resamples = retail_folds,
+  grid = dt_grid,
+  metrics = metric_set(roc_auc),
+  control = control_grid(save_pred = FALSE)
+)
+
+best_dt <- select_best(dt_tune, metric = "roc_auc")
+final_dt_wf <- finalize_workflow(dt_wf, best_dt)
+
+set.seed(2026)
+
+dt_cv <- fit_resamples(
+  final_dt_wf,
+  resamples = retail_folds,
+  metrics = metric_set(roc_auc),
+  control = control_resamples(save_pred = FALSE)
+)
+```
+
+# Model 3 — Tuned Random Forest
+
+**Run a Random Forest and use the best result from `tune_grid()` in the model comparison.**
+
+Random Forest combines bootstrap aggregation with random feature selection. This reduces the high variance of a single decision tree.
+
+To keep this assignment practical to render, I use **100 trees per candidate forest** and a compact Latin-hypercube grid. The assignment still uses 10-fold CV and `tune_grid()` as required, but avoids hundreds of unnecessary candidate forests.
+
+```{r}
+#| label: tune-random-forest
+
+rf_spec <- rand_forest(
+  mode = "classification",
+  trees = 50,
+  mtry = tune(),
+  min_n = tune()
+) |>
+  set_engine(
+    "ranger",
+    importance = "permutation",
+    probability = TRUE,
+    num.threads = 2
+  )
+
+rf_wf <- workflow() |>
+  add_recipe(tree_rec) |>
+  add_model(rf_spec)
+
+rf_params <- extract_parameter_set_dials(rf_wf) |>
+  update(
+    mtry = mtry(c(2L, 12L)),
+    min_n = min_n(c(2L, 30L))
+  )
+
+set.seed(2026)
+
+rf_grid <- grid_latin_hypercube(
+  rf_params,
+  size = 3
+)
+
+set.seed(2026)
+
+rf_tune <- tune_grid(
+  rf_wf,
+  resamples = retail_folds,
+  grid = rf_grid,
+  metrics = metric_set(roc_auc),
+  control = control_grid(save_pred = FALSE)
+)
+
+best_rf <- select_best(rf_tune, metric = "roc_auc")
+final_rf_wf <- finalize_workflow(rf_wf, best_rf)
+```
+
+# Model 4 — Tuned XGBoost
+
+**Run XGBoost and use the best result from `tune_grid()` in the model comparison.**
+
+XGBoost builds trees sequentially. Each tree contributes a correction to the current ensemble. I tune a compact set of hyperparameters while fixing the total number of trees at 100 to control render time.
+
+```{r}
+#| label: tune-xgboost
+
+xgb_spec <- boost_tree(
+  mode = "classification",
+  trees = 50,
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = 0.8
+) |>
+  set_engine("xgboost", nthread = 2)
+
+xgb_wf <- workflow() |>
+  add_recipe(tree_rec) |>
+  add_model(xgb_spec)
+
+set.seed(2026)
+
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(range = c(2L, 6L)),
+  learn_rate(range = c(-2.0, -0.7)),
+  min_n(range = c(5L, 30L)),
+  loss_reduction(range = c(-6, 0)),
+  size = 3
+)
+
+set.seed(2026)
+
+xgb_tune <- tune_grid(
+  xgb_wf,
+  resamples = retail_folds,
+  grid = xgb_grid,
+  metrics = metric_set(roc_auc),
+  control = control_grid(save_pred = FALSE)
+)
+
+best_xgb <- select_best(xgb_tune, metric = "roc_auc")
+final_xgb_wf <- finalize_workflow(xgb_wf, best_xgb)
+```
+
+# Four-Model 10-Fold CV Comparison
+
+**Using 10-fold cross-validation, compare all four models on CV `roc_auc`. Use `fit_resamples()` for Lasso Logistic Regression and Decision Tree; use the `tune_grid()` best results for Random Forest and XGBoost. Which model achieves the highest CV `roc_auc`? Is the difference from the second-best model larger than one standard error?**
+
+For Random Forest and XGBoost, the reported CV estimates come directly from their best `tune_grid()` results. Lasso and the finalized Decision Tree are re-evaluated using `fit_resamples()` as requested.
+
+```{r}
+#| label: build-cv-results
+
+lasso_cv_row <- collect_metrics(lasso_cv) |>
+  filter(.metric == "roc_auc") |>
+  transmute(
+    model = "Lasso Logistic Regression",
+    mean = mean,
+    std_err = std_err
+  )
+
+dt_cv_row <- collect_metrics(dt_cv) |>
+  filter(.metric == "roc_auc") |>
+  transmute(
+    model = "Decision Tree",
+    mean = mean,
+    std_err = std_err
+  )
+
+rf_cv_row <- collect_metrics(rf_tune) |>
+  semi_join(best_rf, by = names(best_rf)) |>
+  filter(.metric == "roc_auc") |>
+  transmute(
+    model = "Random Forest",
+    mean = mean,
+    std_err = std_err
+  )
+
+xgb_cv_row <- collect_metrics(xgb_tune) |>
+  semi_join(best_xgb, by = names(best_xgb)) |>
+  filter(.metric == "roc_auc") |>
+  transmute(
+    model = "XGBoost",
+    mean = mean,
+    std_err = std_err
+  )
+
+cv_results <- bind_rows(
+  lasso_cv_row,
+  dt_cv_row,
+  rf_cv_row,
+  xgb_cv_row
+) |>
+  arrange(desc(mean)) |>
+  mutate(rank = row_number())
+
+best_model_name <- cv_results$model[1]
+best_cv_auc <- cv_results$mean[1]
+best_cv_se <- cv_results$std_err[1]
+second_model_name <- cv_results$model[2]
+second_cv_auc <- cv_results$mean[2]
+cv_gap <- best_cv_auc - second_cv_auc
+larger_than_one_se <- cv_gap > best_cv_se
+```
+
+```{r}
+#| label: tbl-cv-comparison
+#| tbl-cap: "10-fold cross-validation ROC AUC comparison"
+
+cv_results |>
+  select(rank, model, mean, std_err) |>
+  mutate(
+    mean = round(mean, 4),
+    std_err = round(std_err, 4)
+  ) |>
+  kable()
+```
+
+```{r}
+#| label: fig-cv-comparison
+#| fig-cap: "Mean 10-fold cross-validated ROC AUC by model"
+
+cv_results |>
+  ggplot(aes(x = reorder(model, mean), y = mean)) +
+  geom_col() +
+  geom_errorbar(
+    aes(ymin = mean - std_err, ymax = mean + std_err),
+    width = 0.15
+  ) +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean CV ROC AUC",
+    title = "Four-Model Cross-Validation Comparison"
+  )
+```
+
+The highest mean CV ROC AUC is achieved by **`r best_model_name`**, with an ROC AUC of **`r round(best_cv_auc, 3)`**. The second-best model is **`r second_model_name`**, with an ROC AUC of **`r round(second_cv_auc, 3)`**.
+
+The difference between the two models is **`r round(cv_gap, 4)`**. Based on the best model's standard error of **`r round(best_cv_se, 4)`**, the difference **`r ifelse(larger_than_one_se, "is larger than one standard error", "is not larger than one standard error")`**. This distinction matters because a very small numerical advantage may not represent a meaningful improvement in expected performance.
+
+# Did Tree-Based Methods Outperform?
+
+**Do you expect tree-based methods to outperform the regression-focused model? Why or why not? Did the CV ROC AUC results confirm your expectations?**
+
+I expected the tree-based methods to be competitive because retail revenue can involve **nonlinear relationships and interactions**. For example, the impact of Discount Percentage may change across Product Category or different levels of Units Sold and Marketing Spend. Lasso Logistic Regression can represent an additive linear relationship on the log-odds scale unless interactions and nonlinear terms are explicitly engineered.
+
+The CV results show whether that expectation was supported. In this analysis, the highest-performing model is **`r best_model_name`**. Therefore, **`r ifelse(best_model_name %in% c("Decision Tree", "Random Forest", "XGBoost"), "the results support the expectation that a tree-based model can capture useful structure beyond the regularized logistic baseline", "the results do not show a clear tree-based advantage; the simpler regularized logistic model captured the important predictive structure well")`**.
+
+# What Do the Results Say About the Dataset?
+
+**What would the result tell you about the relationships in this dataset, and which model would you recommend for deployment?**
+
+If an ensemble model clearly outperforms Lasso Logistic Regression, it suggests that the outcome depends on interactions, thresholds, or nonlinear patterns that are not fully represented by an additive linear classifier. If the models perform similarly, the business relationship may be simpler, or the extra flexibility of ensembles may not create enough incremental predictive value to justify their complexity.
+
+Based on cross-validation alone, I would recommend **`r best_model_name`** for deployment because it produced the strongest average ROC AUC. However, if its advantage over the second-best model is not larger than one standard error, I would also consider computational cost, stability, and interpretability before making the final production choice.
+
+::: {.callout-important title="Deployment decision"}
+The statistically highest CV score is not automatically the only reasonable deployment choice. If two models perform almost identically, the simpler or faster model can be preferable operationally.
+:::
+
+# Final Model Fitting and Holdout Evaluation
+
+The four workflows are now fitted to the full training set, and the untouched test set is used for a final performance check.
+
+```{r}
+#| label: fit-final-models
+
+final_lasso_fit <- fit(final_lasso_wf, data = retail_train)
+final_dt_fit    <- fit(final_dt_wf, data = retail_train)
+final_rf_fit    <- fit(final_rf_wf, data = retail_train)
+final_xgb_fit   <- fit(final_xgb_wf, data = retail_train)
+
+final_fits <- list(
+  "Lasso Logistic Regression" = final_lasso_fit,
+  "Decision Tree" = final_dt_fit,
+  "Random Forest" = final_rf_fit,
+  "XGBoost" = final_xgb_fit
+)
+
+best_fit <- final_fits[[best_model_name]]
+```
+
+```{r}
+#| label: test-model-function
+#| include: false
+
+test_model <- function(fitted_wf, model_name) {
+  pred <- bind_cols(
+    retail_test |> select(revenue_class),
+    predict(fitted_wf, retail_test, type = "class"),
+    predict(fitted_wf, retail_test, type = "prob")
+  )
+
+  class_metrics(
+    pred,
+    truth = revenue_class,
+    estimate = .pred_class,
+    .pred_high
+  ) |>
+    mutate(model = model_name)
+}
+
+test_results <- imap_dfr(final_fits, test_model)
+```
+
+```{r}
+#| label: tbl-test-results
+#| tbl-cap: "Holdout test-set metrics for all four final models"
+
+test_results |>
+  select(model, .metric, .estimate) |>
+  mutate(.estimate = round(.estimate, 4)) |>
+  pivot_wider(
+    names_from = .metric,
+    values_from = .estimate
+  ) |>
+  arrange(desc(roc_auc)) |>
+  kable()
+```
+
+# Interpret the Best-Performing Model
+
+**Interpret the results of the best-performing model to explain the impact of features on the outcome variable for your client. Include a Variable Importance Plot, PDP, and SHAP.**
+
+The interpretation section uses the **`r best_model_name`** model selected by 10-fold cross-validation.
+
+## Create a Model Explainer
+
+```{r}
+#| label: create-explainer
+
+set.seed(2026)
+
+# A representative sample keeps interpretation fast while preserving
+# the overall distribution of the training data.
+explain_data <- retail_train |>
+  slice_sample(n = min(1000, nrow(retail_train)))
+
+explainer_best <- explain_tidymodels(
+  model = best_fit,
+  data = explain_data |> select(-revenue_class),
+  y = if_else(explain_data$revenue_class == "high", 1, 0),
+  label = best_model_name,
+  verbose = FALSE
+)
+```
+
+# Variable Importance Plot
+
+**Variable Important Plot**
+
+Permutation importance measures how much model performance worsens when a feature is randomly disrupted. It identifies variables the model relies on most, but by itself it does **not** show whether a variable increases or decreases predicted high-revenue probability.
+
+```{r}
+#| label: fig-variable-importance
+#| fig-cap: "Permutation variable importance for the best-performing model"
+#| fig-height: 7
+
+set.seed(2026)
+
+vip_best <- model_parts(
+  explainer_best,
+  loss_function = loss_one_minus_auc,
+  B = 3
+)
+
+plot(vip_best, max_vars = 12)
+```
+
+The importance chart should be interpreted comparatively. Variables with longer bars are more influential to prediction. For AO 3, the central question is whether **Discount Percentage** is among the strongest predictors or whether **Units Sold, Marketing Spend, Product Category, and timing variables** provide more predictive information.
+
+# Partial Dependence Plot (PDP)
+
+**PDP**
+
+A Partial Dependence Plot shows how the model's average prediction changes as a selected feature changes while averaging over the observed values of the other predictors.
+
+I focus on **Discount Percentage** because it is the primary variable in AO 3.
+
+```{r}
+#| label: fig-pdp-discount
+#| fig-cap: "Partial dependence of predicted high-revenue probability on Discount Percentage"
+
+pdp_discount <- model_profile(
+  explainer_best,
+  variables = "discount_percentage",
+  type = "partial"
+)
+
+plot(pdp_discount)
+```
+
+Figure @fig-pdp-discount shows whether predicted high-revenue probability rises, falls, remains flat, or changes nonlinearly as Discount Percentage changes. A mostly flat curve would imply that discount level contributes little directional change after the model accounts for the other features. A curved or threshold pattern would suggest a nonlinear relationship.
+
+# SHAP Interpretation
+
+**SHAP**
+
+SHAP values provide a **local explanation** for one observation by showing how each feature pushes the prediction away from the model's baseline prediction.
+
+To keep rendering reasonable, I calculate SHAP values for one representative test transaction using **10 permutations** rather than a large number of repeated permutations.
+
+```{r}
+#| label: select-shap-observation
+
+shap_customer <- retail_test |>
+  select(-revenue_class) |>
+  slice(10)
+
+shap_customer |>
+  kable(caption = "Transaction used for the local SHAP explanation")
+```
+
+```{r}
+#| label: fig-shap
+#| fig-cap: "Local SHAP explanation for one test transaction"
+
+set.seed(2026)
+
+shap_result <- predict_parts(
+  explainer_best,
+  new_observation = shap_customer,
+  type = "shap",
+  B = 5
+)
+
+plot(shap_result)
+```
+
+Positive SHAP contributions push the prediction toward **high revenue**, while negative contributions push it toward **low revenue**. Unlike the overall variable-importance plot, this explanation is specific to one transaction.
+
+# Client Recommendations
+
+**From the charts above, what recommendations would you make to the client?**
+
+The recommendations should be based on the model interpretation rather than on model accuracy alone.
+
+First, the client should prioritize the variables that appear at the top of the permutation-importance chart because those features contain the most useful predictive information for distinguishing high- and low-revenue transactions.
+
+Second, the **Discount Percentage PDP** should guide how discounting is interpreted. If predicted high-revenue probability changes only slightly across discount levels, the company should avoid assuming that deeper discounts automatically generate stronger revenue outcomes. If the PDP shows a clear nonlinear range or threshold, that range deserves additional business testing.
+
+Third, the SHAP explanation demonstrates that the same discount level can have a different role depending on the other characteristics of a transaction. Therefore, promotions should be evaluated together with **Units Sold, Marketing Spend, Product Category, and timing**, rather than treating discounting as an isolated lever.
+
+> **Client recommendation:** Use the best-performing model as a decision-support tool to identify high-revenue opportunities, but combine its predictions with feature-level explanations. Focus promotional resources on combinations of characteristics associated with higher predicted revenue rather than automatically increasing discount depth.
+
+::: {.callout-warning title="Prediction is not causation"}
+VIP, PDP, and SHAP explain how the fitted model uses the data. They do not prove that changing a predictor such as Discount Percentage will causally change Sales Revenue.
+:::
+
+# Appendix
+
+- Published GitHub Pages Report: <https://brahhmen55.github.io/IBM6540/>
+- GitHub Repository: <https://github.com/Brahhmen55/IBM6540>
+
