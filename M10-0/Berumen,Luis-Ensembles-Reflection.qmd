@@ -1,0 +1,459 @@
+---
+title: "Reflection on Ensembles: Bagging and Boosting"
+subtitle: "Understanding the Algorithms"
+author: "Luis Berumen"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-expand: true
+    toc-location: right-body
+    toc-title: "Contents"
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+    code-overflow: wrap
+    highlight-style: github
+    df-print: paged
+execute:
+  echo: true
+  warning: false
+  message: false
+  freeze: true
+---
+
+# Random Forests Part 1 - Building, Using and Evaluating
+
+## Concept Summary
+
+Random Forests improve on individual decision trees by combining many trees into one ensemble. Each tree is built using a **bootstrap sample**, which means observations are randomly sampled from the original dataset with replacement. Because sampling is performed with replacement, some observations may appear multiple times while others are left out.
+
+At each split in a tree, the algorithm considers only a **random subset of predictors** instead of using all available predictors. This additional randomness makes the trees less similar to one another. For classification, the final prediction is typically based on a majority vote across the trees.
+
+Random Forests can also estimate their own predictive error using **out-of-bag observations**. These are observations that were not selected for a particular tree's bootstrap sample.
+
+## Key Terminology
+
+- **Bootstrap sample:** A sample drawn with replacement from the original training data.
+- **Random feature selection:** Considering only a random subset of variables at each possible split.
+- **Bagging:** Combining predictions from many models built on resampled datasets.
+- **Out-of-bag (OOB) data:** Observations not included in a tree's bootstrap training sample.
+- **OOB error:** The prediction error calculated using out-of-bag observations.
+
+## Key Takeaway
+
+Random Forests reduce the instability of a single decision tree by combining many diverse trees. The two main sources of diversity are **bootstrapping observations** and **randomly selecting features at each split**.
+
+# Random Forests Part 2: Missing data and clustering
+
+## Concept Summary
+
+Random Forests can also help handle missing values and discover similarity among observations. Missing numerical values can first be filled using a rough estimate such as the median, while missing categorical values can be replaced using the mode.
+
+After a forest is built, a **proximity matrix** can be created. Two observations receive a higher proximity when they frequently end up in the same terminal leaf across the trees. These proximities can then be used to improve missing-value estimates.
+
+For a numerical variable, a missing value can be updated using a proximity-weighted average of known values. For a categorical variable, the estimated category can be based on nearby observations. The forest can be rebuilt and the process repeated until the estimates stabilize.
+
+The proximity matrix can also be converted into a distance matrix:
+
+$$\text{Distance} = 1 - \text{Proximity}$$ {#eq-distance}
+
+This distance information can be visualized using techniques such as multidimensional scaling.
+
+## Key Terminology
+
+- **Imputation:** Replacing missing values with estimated values.
+- **Proximity matrix:** A matrix describing how frequently pairs of observations end in the same leaves.
+- **Iterative imputation:** Repeatedly updating missing values until the estimates stabilize.
+- **Distance matrix:** A representation of dissimilarity; here, it can be calculated using Equation @eq-distance.
+- **Multidimensional scaling (MDS):** A technique used to visualize similarities or distances among observations.
+
+## Key Takeaway
+
+The proximity matrix expands Random Forests beyond prediction. It can support both **missing-data imputation** and **unsupervised exploration of clusters**.
+
+# Random Forests in R
+
+## Concept Summary
+
+This video demonstrates how Random Forests can be implemented in R. The workflow begins by loading packages, importing data, cleaning the dataset, and converting categorical variables into factors.
+
+Missing data can be estimated using `rfImpute()`, and the Random Forest itself can be built using `randomForest()`. Two important tuning ideas are the number of trees and the number of candidate variables considered at each split.
+
+The model can be evaluated using the OOB error rate, and the proximity matrix can be used to create an MDS visualization.
+
+## Key Terminology
+
+- **Factor:** An R data type used for categorical variables.
+- **`rfImpute()`:** A Random Forest-based imputation function.
+- **`randomForest()`:** A function used to build Random Forest models.
+- **`ntree`:** Number of trees in the forest.
+- **`mtry`:** Number of predictors randomly considered at each split.
+
+## Key Takeaway
+
+The R workflow connects the theory from the previous Random Forest videos to practical model building, tuning, evaluation, missing-data handling, and visualization.
+
+# AdaBoost, Clearly Explained
+
+## Concept Summary
+
+AdaBoost, short for **Adaptive Boosting**, builds a strong classifier from a sequence of weak learners. The weak learners are often **decision stumps**, which contain only one split.
+
+Unlike Random Forests, the learners are not built independently. AdaBoost builds them sequentially. All observations begin with equal weight. After each stump is created, incorrectly classified observations receive more weight while correctly classified observations receive less weight. The next stump therefore focuses more heavily on difficult observations.
+
+Each stump also receives an **amount of say** based on its performance. A common expression is:
+
+$$\alpha =
+\frac{1}{2}
+\ln\left(
+\frac{1-\text{Error}}
+{\text{Error}}
+\right)$$ {#eq-adaboost}
+
+Stumps with lower error have more influence in the final weighted vote.
+
+## Key Terminology
+
+- **Weak learner:** A simple model that performs only moderately well by itself.
+- **Decision stump:** A tree with one split and two terminal leaves.
+- **Sample weight:** The importance assigned to a training observation.
+- **Amount of say:** The weight assigned to each weak learner.
+- **Boosting:** Building models sequentially so later learners address earlier mistakes.
+
+## Key Takeaway
+
+AdaBoost improves performance by making each new learner focus more on observations that were previously misclassified and then combining all learners using weighted voting.
+
+# Gradient Boost Part 1 (of 4): Regression Main Ideas
+
+## Concept Summary
+
+Gradient Boost for regression starts with a simple baseline prediction, usually the average of the target variable. The model then calculates **residuals**, which represent the difference between observed and predicted values:
+
+$$r = y - \hat{y}$$ {#eq-residual}
+
+A regression tree is trained to predict these residuals rather than the original target values. The correction from the tree is multiplied by a **learning rate** before being added to the existing prediction.
+
+The general update is:
+
+$$\hat{y}_{new}
+=
+\hat{y}_{old}
++
+\nu h(x)$$
+
+where $\nu$ is the learning rate and $h(x)$ is the tree's predicted correction.
+
+## Key Terminology
+
+- **Residual:** Observed value minus predicted value.
+- **Learning rate:** A value controlling how much each new tree changes the current model.
+- **Regression tree:** A decision tree used to predict numerical outcomes.
+- **Boosting:** Sequentially adding models to improve previous predictions.
+
+## Key Takeaway
+
+Gradient Boost regression improves predictions in small steps by repeatedly fitting new trees to the remaining residual errors.
+
+# Gradient Boost Part 2 (of 4): Regression Details
+
+## Concept Summary
+
+The mathematical explanation of Gradient Boost introduces a **loss function**. For squared-error regression, a convenient form is:
+
+$$L(y,F(x))
+=
+\frac{1}{2}(y-F(x))^2$$ {#eq-squared-loss}
+
+The algorithm calculates the **negative gradient** of this loss. For squared-error regression, the result simplifies to the familiar residual:
+
+$$-\frac{\partial L}{\partial F(x)}
+=
+y-F(x)$$
+
+These values are called **pseudo-residuals**. A regression tree is fitted to them, terminal-leaf outputs are calculated, and the model is updated using the learning rate.
+
+## Key Terminology
+
+- **Loss function:** A mathematical measure of prediction error.
+- **Gradient:** The first derivative of the loss function.
+- **Pseudo-residual:** The negative gradient of the loss with respect to the current prediction.
+- **Leaf output:** The numerical correction produced by a terminal leaf.
+
+## Key Takeaway
+
+Gradient Boost is not limited to ordinary residuals. Its broader principle is to fit each new learner to the **negative gradient of the loss function**, which tells the model how to reduce error.
+
+# Gradient Boost Part 3 (of 4): Classification
+
+## Concept Summary
+
+Gradient Boost classification uses the same sequential correction idea as regression, but it works with **probabilities and log-odds**.
+
+The initial model starts from the log-odds of the positive class:
+
+$$\log\left(\frac{p}{1-p}\right)$$ {#eq-logodds}
+
+Log-odds can be converted to probability using the logistic function:
+
+$$p=
+\frac{e^F}{1+e^F}$$ {#eq-logistic}
+
+For binary classification, pseudo-residuals simplify to:
+
+$$r=y-p$$ {#eq-class-residual}
+
+New trees are trained to predict these pseudo-residuals, and their outputs are added to the current log-odds score after being scaled by the learning rate.
+
+## Key Terminology
+
+- **Log-odds:** The logarithm of the odds of an event.
+- **Probability:** A value between 0 and 1 describing the likelihood of an outcome.
+- **Logistic function:** Converts a log-odds score into probability.
+- **Pseudo-residual:** For binary classification, observed outcome minus predicted probability.
+
+## Key Takeaway
+
+Gradient Boost classification applies boosting on the log-odds scale, using probability-based pseudo-residuals to guide each new tree.
+
+# Gradient Boost Part 4 (of 4): Classification Details
+
+## Concept Summary
+
+Gradient Boost classification commonly minimizes **negative log-likelihood**, also called log loss or binary cross-entropy:
+
+$$L
+=
+-[y\log(p)+(1-y)\log(1-p)]$$ {#eq-logloss}
+
+The pseudo-residual remains:
+
+$$r=y-p$$
+
+The output value for a leaf can be calculated as:
+
+$$\gamma
+=
+\frac{\sum(y-p)}
+{\sum p(1-p)}$$ {#eq-gb-leaf}
+
+The model then updates the log-odds prediction using the learning rate:
+
+$$F_{new}
+=
+F_{old}
++
+\nu\gamma$$
+
+The updated score is converted back to probability, and the process repeats.
+
+## Key Terminology
+
+- **Log loss:** A loss function for probabilistic binary classification.
+- **Binary cross-entropy:** Another name for binary log loss.
+- **Leaf correction:** The amount a leaf contributes to the log-odds score.
+- **Learning rate:** Controls the size of each correction.
+
+## Key Takeaway
+
+Gradient Boost classification minimizes log loss by repeatedly fitting trees to $y-p$ pseudo-residuals and updating predictions on the log-odds scale.
+
+# XGBoost Part 1 (of 4): Regression
+
+## Concept Summary
+
+XGBoost, or **Extreme Gradient Boosting**, extends gradient boosting with regularization and optimized tree construction. In the simplified regression setting, XGBoost begins with an initial prediction and calculates residuals.
+
+Potential tree nodes are evaluated with a **similarity score**:
+
+$$SS
+=
+\frac{(\sum r)^2}
+{n+\lambda}$$ {#eq-xgb-reg-ss}
+
+where $\lambda$ is a regularization parameter.
+
+The quality of a split is evaluated with **gain**:
+
+$$Gain
+=
+SS_L+SS_R-SS_P$$ {#eq-gain}
+
+Terminal-leaf outputs can be calculated using:
+
+$$Output
+=
+\frac{\sum r}
+{n+\lambda}$$
+
+The learning rate, often written as $\eta$, controls how strongly the tree updates the current model.
+
+## Key Terminology
+
+- **XGBoost:** A highly optimized, regularized gradient-boosting framework.
+- **Similarity score:** A measure used to evaluate how well residuals fit together within a node.
+- **Gain:** Improvement produced by a split.
+- **Lambda (**$\lambda$): Regularization parameter.
+- **Gamma (**$\gamma$): Minimum improvement associated with keeping a split.
+- **Eta (**$\eta$): Learning rate.
+
+## Key Takeaway
+
+XGBoost regression follows the boosting framework but adds explicit regularization and specialized split calculations to control complexity and improve generalization.
+
+# XGBoost Part 2 (of 4): Classification
+
+## Concept Summary
+
+XGBoost classification works with probabilities and log-odds. In the StatQuest example, predictions begin at $p=0.5$, which corresponds to log-odds of 0.
+
+The residual for binary classification is:
+
+$$r=y-p$$
+
+The classification similarity score is:
+
+$$SS
+=
+\frac{[\sum(y-p)]^2}
+{\sum p(1-p)+\lambda}$$ {#eq-xgb-class-ss}
+
+The quantity $\sum p(1-p)$ is related to **cover**, which is used to describe the amount of information within a node.
+
+The leaf output is:
+
+$$Output
+=
+\frac{\sum(y-p)}
+{\sum p(1-p)+\lambda}$$ {#eq-xgb-class-output}
+
+The score is updated with the learning rate and converted back into a probability.
+
+## Key Terminology
+
+- **Cover:** A Hessian-based measure of the amount of information represented in a node.
+- **Lambda:** Regularizes leaf outputs and similarity scores.
+- **Gamma:** Helps determine whether a split is worth keeping.
+- **Eta:** Controls how much each tree contributes.
+
+## Key Takeaway
+
+XGBoost classification combines Gradient Boost-style probability corrections with regularization, gain calculations, and structural constraints on tree growth.
+
+# XGBoost Part 3 (of 4): Mathematical Details
+
+## Concept Summary
+
+XGBoost minimizes an objective that contains both prediction loss and model regularization:
+
+$$\text{Objective}
+=
+\text{Loss}
++
+\text{Regularization}$$ {#eq-xgb-objective}
+
+To make optimization efficient, XGBoost uses a **second-order Taylor approximation**. This introduces the gradient $g_i$ and Hessian $h_i$.
+
+The general optimal leaf value is:
+
+$$w^*
+=
+-\frac{\sum_i g_i}
+{\sum_i h_i+\lambda}$$ {#eq-xgb-leaf-general}
+
+The general similarity score is:
+
+$$SS
+=
+\frac{(\sum_i g_i)^2}
+{\sum_i h_i+\lambda}$$ {#eq-xgb-sim-general}
+
+For squared-error regression, the Hessian is 1. For binary logistic classification, the Hessian is:
+
+$$h_i=p_i(1-p_i)$$
+
+These formulas explain why the regression and classification equations from the previous XGBoost videos look similar.
+
+## Key Terminology
+
+- **Gradient (**$g$): First derivative of the loss function.
+- **Hessian (**$h$): Second derivative of the loss function.
+- **Taylor approximation:** A mathematical approximation used to simplify optimization.
+- **Regularization:** A penalty that discourages overly complex models.
+
+## Key Takeaway
+
+XGBoost unifies regression and classification through the same mathematical framework: **gradients, Hessians, regularization, leaf outputs, similarity scores, and gain**.
+
+# XGBoost Part 4 (of 4): Crazy Cool Optimizations
+
+## Concept Summary
+
+The final XGBoost video focuses on computational optimizations that make the algorithm efficient on large datasets.
+
+The **approximate greedy algorithm** uses quantiles as candidate split points rather than evaluating every possible threshold. The **weighted quantile sketch** extends this idea using Hessian-based weights.
+
+XGBoost can also parallelize parts of tree construction, even though boosting itself remains sequential. It supports **sparsity-aware split finding** by learning a default direction for missing values.
+
+Additional optimizations include cache-aware memory access and out-of-core computation for datasets too large to fit in RAM.
+
+## Key Terminology
+
+- **Approximate greedy algorithm:** Uses selected candidate thresholds rather than checking every possible split.
+- **Weighted quantile sketch:** Efficiently estimates weighted candidate split points.
+- **Parallel learning:** Performs eligible tree-building calculations simultaneously.
+- **Sparsity-aware splitting:** Learns how missing or sparse values should move through a tree.
+- **Cache-aware access:** Organizes computation to take advantage of fast CPU cache.
+- **Out-of-core computation:** Processes datasets larger than available RAM.
+- **Sharding:** Splitting data across storage devices or systems.
+
+## Key Takeaway
+
+XGBoost's strength comes not only from its statistical framework but also from engineering choices that make training fast and scalable.
+
+# Comparing Bagging and Boosting
+
+## Reflection Prompt
+
+**Reflect on what you learned in this module about ensemble learning, especially the differences between bagging and boosting.**
+
+## Reflection
+
+The clearest distinction I learned is that **bagging builds models independently, while boosting builds them sequentially**. Random Forests are a bagging method because each tree is trained separately using bootstrapped observations and random subsets of features. Their predictions are then aggregated.
+
+AdaBoost, Gradient Boost, and XGBoost are boosting methods. Each new learner depends on the performance of the previous model. AdaBoost changes observation weights so later learners focus on mistakes. Gradient Boost fits new trees to the negative gradient of a loss function. XGBoost follows a similar framework but adds regularization, Hessian information, specialized tree-building rules, and computational optimizations.
+
+Table @tbl-comparison summarizes the major differences.
+
+| Method | Core Strategy | Trees/Learners | How Improvement Happens | Important Feature |
+|---------------|---------------|---------------|---------------|---------------|
+| Random Forest | Bagging | Independent trees | Average/vote across diverse trees | Bootstrapping + random features |
+| AdaBoost | Boosting | Sequential weak learners | Reweights difficult observations | Weighted voting |
+| Gradient Boost | Boosting | Sequential trees | Fits negative gradients/errors | Learning rate |
+| XGBoost | Boosting | Sequential regularized trees | Fits gradients and Hessians | Regularization + optimization |
+
+: Comparison of ensemble methods
+
+::: panel-tabset
+## Bagging
+
+Bagging creates multiple versions of a model using resampled data and then combines their predictions. Its major advantage is that it can reduce instability and variance.
+
+## Boosting
+
+Boosting creates models sequentially. Each learner is designed to improve the current ensemble by focusing on errors or the gradient of a loss function.
+
+## My Interpretation
+
+I now think of bagging as **parallel diversity** and boosting as **sequential correction**. That distinction makes it easier to remember how the algorithms differ.
+:::
+
+# Appendix
+
+- Published GitHub Pages Report: <https://brahhmen55.github.io/IBM6540/>
+- GitHub Repository: <https://github.com/Brahhmen55/IBM6540>
+
