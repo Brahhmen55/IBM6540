@@ -1,0 +1,658 @@
+---
+title: "Reflection on Trees with Group Project Data"
+subtitle: "Analytics Objective: Predict High vs. Low Retail Sales Revenue and Evaluate the Role of Discounts"
+author: "Luis Berumen"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-expand: 1
+    toc-location: right-body
+    toc-title: "Contents"
+    number-sections: true
+    code-fold: show
+    code-overflow: wrap
+    code-tools: true
+    theme: cosmo
+    highlight-style: github
+    df-print: paged
+    embed-resources: true
+    smooth-scroll: true
+output-file: index.html
+execute:
+  warning: false
+  message: false
+  freeze: false
+editor: visual
+---
+
+```{r}
+#| label: global-setup
+#| include: false
+
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(lubridate)
+library(tidymodels)
+library(rpart)
+library(ranger)
+library(xgboost)
+library(vip)
+library(scales)
+library(knitr)
+library(purrr)
+
+tidymodels_prefer()
+theme_set(theme_minimal(base_size = 14))
+set.seed(2026)
+
+# Find the Excel file in the project folder.
+xlsx_files <- list.files(
+  ".",
+  pattern = "\\.xlsx$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+data_path <- xlsx_files[grepl("retail|sales", xlsx_files, ignore.case = TRUE)][1]
+if (is.na(data_path)) data_path <- xlsx_files[1]
+if (is.na(data_path)) stop("No Excel (.xlsx) file was found in the project folder.")
+
+retail_raw <- read_excel(data_path) |>
+  clean_names()
+
+# Create a classification outcome based on the median sales revenue.
+revenue_cutoff <- median(retail_raw$sales_revenue_usd, na.rm = TRUE)
+
+retail <- retail_raw |>
+  mutate(
+    revenue_class = factor(
+      if_else(sales_revenue_usd > revenue_cutoff, "high", "low"),
+      levels = c("high", "low")
+    ),
+    date = as.Date(date),
+    month = factor(month(date, label = TRUE, abbr = TRUE)),
+    year = factor(year(date)),
+    season = case_when(
+      month(date) %in% c(12, 1, 2) ~ "Winter",
+      month(date) %in% c(3, 4, 5)  ~ "Spring",
+      month(date) %in% c(6, 7, 8)  ~ "Summer",
+      TRUE                         ~ "Fall"
+    ),
+    season = factor(season, levels = c("Winter", "Spring", "Summer", "Fall")),
+    holiday = factor(if_else(holiday_effect, "Holiday", "Non-holiday")),
+    day = factor(
+      day_of_the_week,
+      levels = c(
+        "Monday", "Tuesday", "Wednesday", "Thursday",
+        "Friday", "Saturday", "Sunday"
+      )
+    ),
+    product_category = factor(product_category)
+  ) |>
+  select(
+    revenue_class,
+    discount_percentage,
+    units_sold,
+    marketing_spend_usd,
+    product_category,
+    day,
+    holiday,
+    month,
+    season,
+    year
+  )
+
+class_metrics <- metric_set(roc_auc, accuracy, sens, spec)
+```
+
+# Task 1 — State the Analytics Objective
+
+**State your AO (Analytics Objective) for your project. If your AO did not involve machine learning, revise it so that the objective is appropriately stated for a machine-learning task. Further state how you will address the objective, including whether it is supervised or unsupervised learning, the variables and their roles, and whether the broader method is regression or classification.**
+
+## Response
+
+### Revised Analytics Objective
+
+My original Group Project AO 3 examined whether **Discount Percentage** was related to **Sales Revenue** after accounting for other retail characteristics. For this Decision Trees assignment, I revise the objective into a classification task:
+
+> **Predict whether a retail transaction will generate high or low Sales Revenue and evaluate whether Discount Percentage is an important predictor after accounting for Units Sold, Marketing Spend, Product Category, season, day of week, and holiday status.**
+
+A transaction is classified as **high revenue** when its Sales Revenue is above the median revenue in the full dataset and **low revenue** otherwise. The median cutoff is **`r dollar(revenue_cutoff)`**.
+
+::: {.callout-note title="Business purpose"}
+For a retail marketing manager, this model provides a practical way to identify transactions that are more likely to produce relatively high revenue and to understand whether discounting adds predictive value after other important retail characteristics are considered.
+:::
+
+### Supervised or Unsupervised Learning
+
+This is **supervised learning** because the model is trained using a known outcome, `revenue_class`, and learns patterns that can be used to classify new observations.
+
+### Variables and Their Roles
+
+| Role | Variable | Purpose |
+|----|----|----|
+| Outcome | `revenue_class` | High vs. low sales revenue |
+| Primary feature | `discount_percentage` | Main promotional variable from AO 3 |
+| Feature | `units_sold` | Measures transaction volume |
+| Feature | `marketing_spend_usd` | Measures promotional support |
+| Feature | `product_category` | Captures differences among product types |
+| Feature | `day` | Captures day-of-week patterns |
+| Feature | `holiday` | Captures holiday effects |
+| Feature | `month`, `season`, `year` | Captures time and seasonality |
+
+`store_id` and `product_id` are excluded because they function mainly as identifiers. `store_location` is excluded from the main model because it has many categories and is not central to AO 3.
+
+### Broader Machine-Learning Category
+
+The broader machine-learning category is **classification** because the outcome has two categories: high revenue and low revenue.
+
+# Task 2 — Choose a Decision Tree Method
+
+**Choose either a Classification Tree or a Regression Tree for your chosen machine-learning task.**
+
+## Response
+
+I use a **Classification Tree** because the revised outcome, `revenue_class`, is categorical. A classification tree recursively splits the predictor space into groups that become increasingly homogeneous with respect to high versus low revenue.
+
+A classification tree is appropriate for this AO because it can capture **nonlinear relationships and interactions** without requiring me to specify them in advance. For example, the importance of a discount may depend on product category, units sold, or marketing spend.
+
+The tree is also attractive from a business perspective because its decision rules can be explained as a sequence of understandable **if-then splits**.
+
+# Task 3 — Complete the Machine-Learning Process
+
+**Set up your QMD file with appropriate libraries and data and go through the entire machine-learning process for your AO according to the process explained in the codebook.**
+
+# Data Preparation and Exploration
+
+## Data Overview
+
+```{r}
+#| label: tbl-data-overview
+#| tbl-cap: "Retail classification dataset overview"
+
+retail |>
+  summarise(
+    observations = n(),
+    high_revenue = sum(revenue_class == "high"),
+    low_revenue = sum(revenue_class == "low"),
+    median_revenue_cutoff = revenue_cutoff,
+    average_discount = mean(discount_percentage, na.rm = TRUE),
+    average_units_sold = mean(units_sold, na.rm = TRUE),
+    average_marketing_spend = mean(marketing_spend_usd, na.rm = TRUE)
+  ) |>
+  mutate(
+    median_revenue_cutoff = dollar(median_revenue_cutoff),
+    average_discount = percent(average_discount / 100, accuracy = 0.1),
+    average_units_sold = round(average_units_sold, 2),
+    average_marketing_spend = dollar(average_marketing_spend)
+  ) |>
+  kable()
+```
+
+Table @tbl-data-overview summarizes the data used for the classification task.
+
+```{r}
+#| label: fig-class-balance
+#| fig-cap: "Distribution of high- and low-revenue transactions"
+
+retail |>
+  count(revenue_class) |>
+  ggplot(aes(revenue_class, n)) +
+  geom_col() +
+  labs(
+    x = "Revenue class",
+    y = "Number of transactions",
+    title = "Outcome Class Balance"
+  )
+```
+
+Figure @fig-class-balance checks whether the outcome classes are reasonably balanced before modeling.
+
+# Data Splitting
+
+**Go through the entire machine-learning process, including data splitting, recipe creation, model specification, model fitting, model evaluation, and interpretation.**
+
+```{r}
+#| label: split-data
+
+set.seed(2026)
+
+retail_split <- initial_split(
+  retail,
+  prop = 0.80,
+  strata = revenue_class
+)
+
+retail_train <- training(retail_split)
+retail_test  <- testing(retail_split)
+
+tibble(
+  sample = c("Training", "Testing"),
+  observations = c(nrow(retail_train), nrow(retail_test))
+) |>
+  kable()
+```
+
+I use an **80/20 stratified split**. Stratification preserves the proportion of high- and low-revenue observations in both sets. The test data remain untouched while the models are developed.
+
+# Recipe Creation
+
+```{r}
+#| label: classification-recipe
+
+tree_rec <- recipe(revenue_class ~ ., data = retail_train) |>
+  step_unknown(all_nominal_predictors()) |>
+  step_novel(all_nominal_predictors()) |>
+  step_dummy(all_nominal_predictors())
+
+tree_rec
+```
+
+The recipe defines the outcome and predictors, protects against unknown or novel categorical levels, and dummy-codes nominal predictors so that the same preprocessing can be used across all models in the comparison.
+
+# Initial Decision Tree
+
+**First, pick a machine-learning method and explain why the method would be the best.**
+
+My initial method is a **classification decision tree**. It is a strong choice for this assignment because it directly matches the required tree topic, handles nonlinear relationships, captures interactions, and produces decision rules that are easier for a marketing manager to interpret than many black-box methods.
+
+```{r}
+#| label: tree-spec
+
+tree_spec <- decision_tree(
+  mode = "classification",
+  cost_complexity = 0.001,
+  tree_depth = 10,
+  min_n = 20
+) |>
+  set_engine("rpart")
+
+tree_wf <- workflow() |>
+  add_recipe(tree_rec) |>
+  add_model(tree_spec)
+
+tree_fit <- fit(tree_wf, data = retail_train)
+```
+
+# Model Evaluation
+
+```{r}
+#| label: tree-test-metrics
+#| tbl-cap: "Decision tree test-set performance"
+
+tree_test_pred <- bind_cols(
+  retail_test |> select(revenue_class),
+  predict(tree_fit, retail_test, type = "class"),
+  predict(tree_fit, retail_test, type = "prob")
+)
+
+tree_test_metrics <- class_metrics(
+  tree_test_pred,
+  truth = revenue_class,
+  estimate = .pred_class,
+  .pred_high
+)
+
+tree_test_metrics |>
+  mutate(.estimate = round(.estimate, 4)) |>
+  kable()
+```
+
+The decision tree's test ROC AUC is **`r round(tree_test_metrics |> filter(.metric == "roc_auc") |> pull(.estimate), 3)`** and its test accuracy is **`r round(tree_test_metrics |> filter(.metric == "accuracy") |> pull(.estimate), 3)`**. ROC AUC is especially useful because it evaluates how well the model ranks high-revenue observations above low-revenue observations across classification thresholds.
+
+::: {.callout-tip title="How to read ROC AUC"}
+An ROC AUC of 0.50 represents ranking performance similar to chance, while values closer to 1.00 indicate stronger discrimination between the two revenue classes.
+:::
+
+# Alternative Methods
+
+**What alternative methods can you try to improve the metrics produced above? Try them.**
+
+I compare the decision tree with three alternatives:
+
+1.  **Logistic regression** as a simple linear classification baseline.
+2.  **Random forest** to reduce the instability and variance of a single tree by averaging many trees.
+3.  **XGBoost** to build trees sequentially so that later trees focus on correcting errors made by earlier trees.
+
+::: panel-tabset
+## Logistic Regression
+
+```{r}
+log_spec <- logistic_reg(mode = "classification") |>
+  set_engine("glm")
+
+log_wf <- workflow() |>
+  add_recipe(tree_rec) |>
+  add_model(log_spec)
+```
+
+## Decision Tree
+
+```{r}
+tree_wf
+```
+
+## Random Forest
+
+```{r}
+rf_spec <- rand_forest(
+  mode = "classification",
+  trees = 100,
+  mtry = 6,
+  min_n = 10
+) |>
+  set_engine("ranger", importance = "permutation", probability = TRUE)
+
+rf_wf <- workflow() |>
+  add_recipe(tree_rec) |>
+  add_model(rf_spec)
+```
+
+## XGBoost
+
+```{r}
+xgb_spec <- boost_tree(
+  mode = "classification",
+  trees = 100,
+  tree_depth = 4,
+  learn_rate = 0.05,
+  min_n = 10,
+  loss_reduction = 0
+) |>
+  set_engine("xgboost", nthread = 2)
+
+xgb_wf <- workflow() |>
+  add_recipe(tree_rec) |>
+  add_model(xgb_spec)
+```
+:::
+
+# 10-Fold Cross-Validation Comparison
+
+**Compare all methods you tried using 10-fold cross-validation. Interpret the results. Which one is the best? Does it make sense? Why or why not?**
+
+```{r}
+#| label: ten-fold-cv
+
+set.seed(2026)
+
+retail_folds <- vfold_cv(
+  retail_train,
+  v = 10,
+  strata = revenue_class
+)
+
+cv_control <- control_resamples(save_pred = FALSE)
+
+log_cv <- fit_resamples(
+  log_wf,
+  resamples = retail_folds,
+  metrics = metric_set(roc_auc, accuracy),
+  control = cv_control
+)
+
+tree_cv <- fit_resamples(
+  tree_wf,
+  resamples = retail_folds,
+  metrics = metric_set(roc_auc, accuracy),
+  control = cv_control
+)
+
+rf_cv <- fit_resamples(
+  rf_wf,
+  resamples = retail_folds,
+  metrics = metric_set(roc_auc, accuracy),
+  control = cv_control
+)
+
+xgb_cv <- fit_resamples(
+  xgb_wf,
+  resamples = retail_folds,
+  metrics = metric_set(roc_auc, accuracy),
+  control = cv_control
+)
+```
+
+```{r}
+#| label: tbl-cv-comparison
+#| tbl-cap: "10-fold cross-validation model comparison"
+
+cv_results <- bind_rows(
+  collect_metrics(log_cv)  |> mutate(model = "Logistic Regression"),
+  collect_metrics(tree_cv) |> mutate(model = "Decision Tree"),
+  collect_metrics(rf_cv)   |> mutate(model = "Random Forest"),
+  collect_metrics(xgb_cv)  |> mutate(model = "XGBoost")
+) |>
+  filter(.metric %in% c("roc_auc", "accuracy")) |>
+  select(model, .metric, mean, std_err) |>
+  arrange(.metric, desc(mean))
+
+cv_results |>
+  mutate(
+    mean = round(mean, 4),
+    std_err = round(std_err, 4)
+  ) |>
+  kable()
+```
+
+```{r}
+#| label: fig-cv-comparison
+#| fig-cap: "Cross-validated ROC AUC by model"
+
+cv_results |>
+  filter(.metric == "roc_auc") |>
+  ggplot(aes(x = reorder(model, mean), y = mean)) +
+  geom_col() +
+  geom_errorbar(
+    aes(ymin = mean - std_err, ymax = mean + std_err),
+    width = 0.15
+  ) +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean ROC AUC",
+    title = "10-Fold Cross-Validation Model Comparison"
+  )
+```
+
+The best model by mean cross-validated ROC AUC is **`r cv_results |> filter(.metric == "roc_auc") |> slice_max(mean, n = 1, with_ties = FALSE) |> pull(model)`**, with a mean ROC AUC of **`r round(cv_results |> filter(.metric == "roc_auc") |> slice_max(mean, n = 1, with_ties = FALSE) |> pull(mean), 3)`**.
+
+This result makes sense if an ensemble model performs best because retail revenue classification may involve nonlinear relationships and interactions among units sold, marketing spend, category, seasonality, and discounts. A single tree is easy to interpret, but an ensemble can reduce the instability of relying on only one set of splits.
+
+# Feature Importance
+
+**Produce a chart that shows the importance of features. Is the result reasonable? Why or why not?**
+
+I use the random forest for the feature-importance chart because permutation importance provides a useful model-based measure of how much predictive performance depends on each feature.
+
+```{r}
+#| label: fit-random-forest
+
+rf_fit <- fit(rf_wf, data = retail_train)
+```
+
+```{r}
+#| label: fig-feature-importance
+#| fig-cap: "Random forest permutation feature importance"
+#| fig-height: 7
+
+rf_fit |>
+  extract_fit_engine() |>
+  vip(num_features = 15)
+```
+
+Figure @fig-feature-importance shows which variables contribute most to the model's predictions. I expect **Units Sold** to be important because transaction volume is directly related to revenue. Product Category and Marketing Spend may also provide substantial predictive information. The importance of **Discount Percentage** is especially relevant to AO 3: if its bar is smaller than those of other variables, that suggests discounting contributes less predictive information than transaction volume, category, or marketing support after the other features are included.
+
+> **Business interpretation:** Feature importance describes predictive usefulness, not causation. A variable can be useful for prediction without proving that changing that variable will cause revenue to change.
+
+# Decision Tree Pruning
+
+**Using the `fit_tree_cp()` function from Section 4.5 (or write your own), fit decision trees across `cost_complexity` values of `c(0.0001, 0.001, 0.005, 0.01, 0.05, 0.10)`. Plot train vs. test AUC across all `cp` values. At what `cp` does test AUC peak? What happens to train AUC at that same value? At the optimal `cp`, how many leaf nodes does the tree have?**
+
+The cost-complexity parameter controls pruning. Small values allow a more complex tree, while larger values penalize complexity more strongly and produce smaller trees.
+
+```{r}
+#| label: pruning-function
+
+fit_tree_cp <- function(cp_value) {
+
+  cp_spec <- decision_tree(
+    mode = "classification",
+    cost_complexity = cp_value,
+    tree_depth = 30,
+    min_n = 2
+  ) |>
+    set_engine("rpart")
+
+  cp_wf <- workflow() |>
+    add_recipe(tree_rec) |>
+    add_model(cp_spec)
+
+  cp_fit <- fit(cp_wf, data = retail_train)
+
+  train_pred <- bind_cols(
+    retail_train |> select(revenue_class),
+    predict(cp_fit, retail_train, type = "prob")
+  )
+
+  test_pred <- bind_cols(
+    retail_test |> select(revenue_class),
+    predict(cp_fit, retail_test, type = "prob")
+  )
+
+  train_auc <- roc_auc(
+    train_pred,
+    truth = revenue_class,
+    .pred_high
+  ) |>
+    pull(.estimate)
+
+  test_auc <- roc_auc(
+    test_pred,
+    truth = revenue_class,
+    .pred_high
+  ) |>
+    pull(.estimate)
+
+  leaves <- cp_fit |>
+    extract_fit_engine() |>
+    pluck("frame") |>
+    filter(var == "<leaf>") |>
+    nrow()
+
+  tibble(
+    cp = cp_value,
+    train_auc = train_auc,
+    test_auc = test_auc,
+    leaf_nodes = leaves,
+    fit = list(cp_fit)
+  )
+}
+```
+
+```{r}
+#| label: pruning-results
+
+cp_values <- c(0.0001, 0.001, 0.005, 0.01, 0.05, 0.10)
+
+cp_results <- map_dfr(cp_values, fit_tree_cp)
+
+cp_results |>
+  select(cp, train_auc, test_auc, leaf_nodes) |>
+  mutate(
+    train_auc = round(train_auc, 4),
+    test_auc = round(test_auc, 4)
+  ) |>
+  kable(
+    caption = "Train and test ROC AUC across cost-complexity values"
+  )
+
+best_cp_row <- cp_results |>
+  slice_max(test_auc, n = 1, with_ties = FALSE)
+
+best_cp <- best_cp_row |> pull(cp)
+best_test_auc <- best_cp_row |> pull(test_auc)
+best_train_auc <- best_cp_row |> pull(train_auc)
+best_leaves <- best_cp_row |> pull(leaf_nodes)
+```
+
+```{r}
+#| label: fig-pruning-auc
+#| fig-cap: "Train versus test ROC AUC across cost-complexity values"
+
+cp_results |>
+  select(cp, train_auc, test_auc) |>
+  pivot_longer(
+    cols = c(train_auc, test_auc),
+    names_to = "sample",
+    values_to = "auc"
+  ) |>
+  mutate(
+    sample = recode(
+      sample,
+      train_auc = "Train",
+      test_auc = "Test"
+    )
+  ) |>
+  ggplot(aes(x = factor(cp), y = auc, group = sample, linetype = sample)) +
+  geom_line() +
+  geom_point(size = 2.5) +
+  labs(
+    x = "Cost complexity (cp)",
+    y = "ROC AUC",
+    linetype = "Sample",
+    title = "Decision Tree Pruning: Train vs. Test AUC"
+  )
+```
+
+As shown in Figure @fig-pruning-auc, test ROC AUC peaks at **`r best_cp`**, where test AUC is **`r round(best_test_auc, 3)`**. At that same `cp`, training AUC is **`r round(best_train_auc, 3)`**.
+
+The comparison between training and testing performance is important. A very small `cp` can allow the tree to become highly complex and fit training observations extremely well. If test AUC is lower, the gap is evidence that the additional complexity does not generalize as well to unseen transactions.
+
+## Number of Leaf Nodes at the Optimal `cp`
+
+The optimal tree contains **`r best_leaves` leaf nodes**.
+
+The leaf count is calculated using the method requested in the assignment:
+
+```{r}
+#| label: optimal-leaves
+
+optimal_tree_fit <- best_cp_row |> pull(fit) |> pluck(1)
+
+optimal_tree_fit |>
+  extract_fit_engine() |>
+  pluck("frame") |>
+  filter(var == "<leaf>") |>
+  nrow()
+```
+
+## Plain-English Explanation for a Marketing Manager
+
+**In plain English, explain to a marketing manager why a tree with 200 leaf nodes might perform worse on new customers than a tree with 15 leaf nodes, even though it was more accurate on the training data.**
+
+A tree with 200 leaf nodes can create many highly specific rules based on small details in the training data. Some of those rules may reflect random noise rather than stable customer behavior. This is **overfitting**.
+
+A 15-leaf tree is simpler. It ignores some small training-data details and focuses on broader patterns that are more likely to repeat for new customers. Therefore, the 200-leaf tree can be more accurate on customers it has already seen while the 15-leaf tree can perform better on new customers.
+
+::: {.callout-important title="Marketing takeaway"}
+More detailed is not always more useful. The goal is not to memorize historical transactions; the goal is to find patterns that continue to work when the retailer encounters new transactions.
+:::
+
+# Final Interpretation
+
+Across this assignment, the single classification tree provides an interpretable model of high versus low revenue, while the alternative models test whether predictive performance improves when the model uses linear classification, bagging, or boosting.
+
+The 10-fold cross-validation comparison indicates that **`r cv_results |> filter(.metric == "roc_auc") |> slice_max(mean, n = 1, with_ties = FALSE) |> pull(model)`** provides the strongest average ROC AUC among the methods tested. The pruning analysis further demonstrates why tree complexity must be controlled: training performance can continue to look strong even after the tree becomes too detailed to generalize effectively.
+
+For AO 3, the feature-importance results should be interpreted in terms of whether **Discount Percentage** remains useful after Units Sold, Marketing Spend, Product Category, and timing variables are considered. This keeps the analysis connected to the original business question while applying the Decision Trees methods from this module.
+
+# Appendix
+
+### Project Links
+
+- Published GitHub Pages Report: <https://brahhmen55.github.io/IBM6540/>
+- GitHub Repository: <https://github.com/Brahhmen55/IBM6540>
